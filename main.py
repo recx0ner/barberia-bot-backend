@@ -1,4 +1,5 @@
 import os
+import random  # Importamos random para elegir la clave al azar
 from flask import Flask, request, jsonify
 import google.generativeai as genai
 from supabase import create_client, Client
@@ -7,21 +8,20 @@ from supabase import create_client, Client
 app = Flask(__name__)
 
 # --- 1. CONFIGURACIÓN DE VARIABLES DE ENTORNO ---
-# Render inyectará estos valores automáticamente si los configuraste en el panel
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Cargamos las 3 API Keys. Asegúrate de ponerlas en las variables de entorno de Render.
+GEMINI_KEYS = [
+    os.environ.get("GEMINI_API_KEY_1"),
+    os.environ.get("GEMINI_API_KEY_2"),
+    os.environ.get("GEMINI_API_KEY_3")
+]
+
+# Filtramos la lista para quitar valores vacíos (por si alguna no está configurada)
+VALID_GEMINI_KEYS = [key for key in GEMINI_KEYS if key]
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# --- 2. CONFIGURACIÓN DE SERVICIOS ---
-
-# Configuración de Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-pro')
-else:
-    print("⚠️ Error: No se encontró la GEMINI_API_KEY")
-
-# Configuración de Supabase
+# --- 2. CONFIGURACIÓN DE SUPABASE ---
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -33,15 +33,13 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 @app.route('/', methods=['GET'])
 def home():
-    """Ruta básica para verificar que el servidor está vivo (Ping)"""
     return jsonify({
         "status": "online",
-        "message": "El chatbot de atención al cliente está activo."
+        "message": "El chatbot está activo y rotando API Keys."
     })
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Ruta principal donde se reciben los mensajes"""
     try:
         data = request.json
         user_message = data.get('message')
@@ -49,17 +47,24 @@ def chat():
         if not user_message:
             return jsonify({"error": "No enviaste ningún mensaje"}), 400
 
-        # --- Lógica del Bot ---
+        # --- Lógica de Rotación de Keys ---
+        if not VALID_GEMINI_KEYS:
+            return jsonify({"error": "No hay API Keys de Gemini configuradas"}), 500
+            
+        # Elegimos una clave al azar de la lista
+        selected_key = random.choice(VALID_GEMINI_KEYS)
         
-        # A. Generar respuesta con Gemini
-        # (Aquí puedes agregar un 'prompt del sistema' si quieres darle personalidad)
+        # Configuramos Gemini con la clave elegida para ESTA petición
+        genai.configure(api_key=selected_key)
+        model = genai.GenerativeModel('gemini-pro')
+
+        # --- Generar respuesta ---
         response = model.generate_content(user_message)
         bot_reply = response.text
 
-        # B. Guardar historial en Supabase (Opcional pero recomendado)
+        # --- Guardar en Supabase (Opcional) ---
         if supabase:
             try:
-                # Asegúrate de tener una tabla llamada 'messages' o cambia el nombre aquí
                 supabase.table('messages').insert({
                     "user_input": user_message,
                     "bot_response": bot_reply
@@ -74,11 +79,7 @@ def chat():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 4. ARRANQUE DEL SERVIDOR (CRÍTICO PARA RENDER) ---
+# --- 4. ARRANQUE DEL SERVIDOR ---
 if __name__ == '__main__':
-    # Render asigna un puerto dinámico en la variable de entorno 'PORT'.
-    # Si no lo encuentra (ej. en tu PC), usa el 5000.
     port = int(os.environ.get("PORT", 5000))
-    
-    # host='0.0.0.0' hace que el servidor sea accesible públicamente en la nube.
     app.run(host='0.0.0.0', port=port)
