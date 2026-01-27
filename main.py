@@ -12,17 +12,17 @@ app = Flask(__name__)
 # --- 1. PROMPT (CEREBRO) ---
 BARBER_PROMPT = """
 Eres el asistente de la "Barbería El Corte Arrechísimo". Hoy es: {current_date}.
-TU OBJETIVO: Gestionar citas y mantener una conversación fluida y amable.
+TU OBJETIVO: Gestionar citas y mantener una conversación fluida.
 
-REGLAS:
-1. Actúa como un barbero profesional que recuerda lo que el cliente le acaba de decir.
-2. Si tienes todos los datos para una acción (Reservar/Cancelar/Reprogramar), genera SOLO el JSON.
-3. Si falta información, pregúntala basándote en lo que ya te han dicho.
+REGLAS CRÍTICAS:
+1. Si el usuario pide CANCELAR o REPROGRAMAR y da la hora, ¡DEBES GENERAR EL JSON! No respondas con texto.
+2. Formato de fechas siempre: YYYY-MM-DD HH:MM (Ej: 2026-01-28 10:30).
+3. Si el usuario solo saluda, responde corto y amable.
 
-ACCIONES JSON (Solo úsalas cuando tengas confirmación de datos):
+ACCIONES JSON (Úsalas obligatoriamente si detectas la intención):
 - RESERVAR: {{"action": "reservar", "nombre": "...", "fecha_hora": "YYYY-MM-DD HH:MM", "servicio": "..."}}
 - CANCELAR: {{"action": "cancelar", "fecha_hora": "YYYY-MM-DD HH:MM"}}
-- REPROGRAMAR: {{"action": "reprogramar", "fecha_hora_vieja": "...", "fecha_hora_nueva": "..."}}
+- REPROGRAMAR: {{"action": "reprogramar", "fecha_hora_vieja": "YYYY-MM-DD HH:MM", "fecha_hora_nueva": "YYYY-MM-DD HH:MM"}}
 """
 
 # --- 2. CONFIGURACIÓN ---
@@ -44,11 +44,42 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         print(f"⚠️ Error Supabase: {e}")
 
-# --- 3. FUNCIONES DE BASE DE DATOS (GESTIÓN) ---
+# --- 3. FUNCIONES DE BASE DE DATOS ROBUSTAS ---
+
 def obtener_id_cliente(chat_id):
+    """Busca el ID del cliente por su chat_id de Telegram"""
     resp = supabase.table('cliente').select("id").eq('telefono', str(chat_id)).execute()
     if resp.data: return resp.data[0]['id']
     return None
+
+def encontrar_cita_flexible(cliente_id, fecha_objetivo_str):
+    """
+    Busca una cita que coincida en día y hora, ignorando segundos y zona horaria.
+    Retorna el ID de la cita si la encuentra.
+    """
+    try:
+        # 1. Convertimos la fecha que dio el usuario a objeto datetime
+        fecha_obj = datetime.strptime(fecha_objetivo_str, "%Y-%m-%d %H:%M")
+        
+        # 2. Traemos TODAS las citas futuras del cliente
+        citas = supabase.table('citas').select("*").eq('cliente_id', cliente_id).execute()
+        
+        if not citas.data:
+            return None
+
+        # 3. Buscamos coincidencia manual en Python
+        for cita in citas.data:
+            # La fecha en DB viene como string ISO (ej: 2026-01-28T10:30:00+00:00)
+            # Cortamos los primeros 16 caracteres para comparar "YYYY-MM-DDTHH:MM"
+            fecha_db_str = cita['fecha_hora'][:16].replace("T", " ")
+            
+            if fecha_db_str == fecha_objetivo_str:
+                return cita['id'] # ¡Encontramos la cita exacta!
+                
+        return None
+    except Exception as e:
+        print(f"Error buscando cita flexible: {e}")
+        return None
 
 def gestionar_reserva(datos, chat_id):
     try:
@@ -56,21 +87,37 @@ def gestionar_reserva(datos, chat_id):
         fecha = datos.get("fecha_hora")
         servicio = datos.get("servicio", "Corte")
         cliente_id = obtener_id_cliente(chat_id)
+        
         if not cliente_id:
+            # Crear cliente si no existe
             nuevo = supabase.table('cliente').insert({"nombre": nombre, "telefono": str(chat_id)}).execute()
             cliente_id = nuevo.data[0]['id']
-        supabase.table('citas').insert({"cliente_id": cliente_id, "servicio": servicio, "fecha_hora": fecha}).execute()
+            
+        supabase.table('citas').insert({
+            "cliente_id": cliente_id, 
+            "servicio": servicio, 
+            "fecha_hora": fecha
+        }).execute()
+        
         return f"✅ ¡Listo {nombre}! Te agendé para el {fecha}."
     except Exception as e: return f"Error reservando: {str(e)}"
 
 def gestionar_cancelacion(datos, chat_id):
     try:
-        fecha = datos.get("fecha_hora")
+        fecha_usuario = datos.get("fecha_hora")
         cliente_id = obtener_id_cliente(chat_id)
         if not cliente_id: return "No te encuentro en el sistema."
-        resp = supabase.table('citas').delete().eq('cliente_id', cliente_id).eq('fecha_hora', fecha).execute()
-        if resp.data: return f"🗑️ Cita del {fecha} cancelada."
-        return "⚠️ No encontré una cita exacta a esa hora."
+
+        # BUSQUEDA INTELIGENTE
+        cita_id = encontrar_cita_flexible(cliente_id, fecha_usuario)
+
+        if cita_id:
+            # Borramos por ID específico (infalible)
+            supabase.table('citas').delete().eq('id', cita_id).execute()
+            return f"🗑️ Cita del {fecha_usuario} cancelada correctamente."
+        else:
+            return f"⚠️ No encontré una cita EXACTAMENTE a las {fecha_usuario}. Verifica la hora."
+
     except Exception as e: return f"Error cancelando: {str(e)}"
 
 def gestionar_reprogramacion(datos, chat_id):
@@ -79,65 +126,48 @@ def gestionar_reprogramacion(datos, chat_id):
         fecha_nueva = datos.get("fecha_hora_nueva")
         cliente_id = obtener_id_cliente(chat_id)
         if not cliente_id: return "No tienes citas para cambiar."
-        resp = supabase.table('citas').update({"fecha_hora": fecha_nueva}).eq('cliente_id', cliente_id).eq('fecha_hora', fecha_vieja).execute()
-        if resp.data: return f"🔄 Cita movida al {fecha_nueva}."
-        return "⚠️ No encontré la cita original."
+
+        # BUSQUEDA INTELIGENTE
+        cita_id = encontrar_cita_flexible(cliente_id, fecha_vieja)
+
+        if cita_id:
+            supabase.table('citas').update({"fecha_hora": fecha_nueva}).eq('id', cita_id).execute()
+            return f"🔄 Cita movida exitosamente al {fecha_nueva}."
+        else:
+            return "⚠️ No encontré la cita original para cambiarla."
+            
     except Exception as e: return f"Error reprogramando: {str(e)}"
 
-# --- 4. NUEVA FUNCIÓN: RECUPERAR MEMORIA ---
+# --- 4. MEMORIA Y CHAT ---
 def obtener_historial_chat(chat_id):
-    """Descarga los últimos 6 mensajes de este usuario para tener contexto"""
     if not supabase: return []
     try:
-        # Buscamos mensajes donde 'user_id' sea igual al chat_id de Telegram
-        response = supabase.table('messages').select('*')\
-            .eq('user_id', str(chat_id))\
-            .order('created_at', desc=True)\
-            .limit(6).execute()
-        
+        response = supabase.table('messages').select('*').eq('user_id', str(chat_id)).order('created_at', desc=True).limit(6).execute()
         historial_gemini = []
         if response.data:
-            # Invertimos la lista para que vaya del más viejo al más nuevo
             for msg in reversed(response.data):
-                # Formato que exige Gemini para el historial
-                if msg.get('user_input'):
-                    historial_gemini.append({"role": "user", "parts": [msg['user_input']]})
-                if msg.get('bot_response'):
-                    historial_gemini.append({"role": "model", "parts": [msg['bot_response']]})
-        
+                if msg.get('user_input'): historial_gemini.append({"role": "user", "parts": [msg['user_input']]})
+                if msg.get('bot_response'): historial_gemini.append({"role": "model", "parts": [msg['bot_response']]})
         return historial_gemini
-    except Exception as e:
-        print(f"Error leyendo historial: {e}")
-        return []
+    except: return []
 
-# --- 5. CEREBRO IA (CON MEMORIA) ---
 def get_gemini_response(user_text, chat_id):
     if not VALID_GEMINI_KEYS: return "⚠️ Error: Sin API Keys."
-    
     try:
         selected_key = random.choice(VALID_GEMINI_KEYS)
         genai.configure(api_key=selected_key)
         
-        # Preparamos el prompt con la fecha
         fecha_hoy = datetime.now().strftime("%Y-%m-%d %H:%M")
         prompt_sistema = BARBER_PROMPT.format(current_date=fecha_hoy)
 
-        model = genai.GenerativeModel(
-            'models/gemini-2.5-flash',
-            system_instruction=prompt_sistema
-        )
-        
-        # 1. RECUPERAMOS EL HISTORIAL DE SUPABASE
+        model = genai.GenerativeModel('models/gemini-2.5-flash', system_instruction=prompt_sistema)
         historial = obtener_historial_chat(chat_id)
-        
-        # 2. INICIAMOS EL CHAT CON ESE CONTEXTO
         chat = model.start_chat(history=historial)
         
-        # 3. ENVIAMOS EL MENSAJE NUEVO
         response = chat.send_message(user_text)
         texto = response.text.strip()
 
-        # Procesar JSON si existe
+        # DETECTOR DE JSON
         if "{" in texto and '"action":' in texto:
             try:
                 json_str = texto.replace("```json", "").replace("```", "").strip()
@@ -147,15 +177,15 @@ def get_gemini_response(user_text, chat_id):
                 if accion == "reservar": return gestionar_reserva(datos, chat_id)
                 elif accion == "cancelar": return gestionar_cancelacion(datos, chat_id)
                 elif accion == "reprogramar": return gestionar_reprogramacion(datos, chat_id)
-            except: pass
+            except Exception as e: print(f"JSON Error: {e}")
         
         return texto
 
     except Exception as e: return f"Error técnico: {str(e)}"
 
-# --- 6. RUTAS ---
+# --- 5. RUTAS ---
 @app.route('/', methods=['GET'])
-def home(): return jsonify({"status": "online", "mode": "Memory Active 🧠"})
+def home(): return jsonify({"status": "online", "mode": "Smart Dates 📅"})
 
 @app.route('/telegram', methods=['POST'])
 def telegram_webhook():
@@ -165,19 +195,17 @@ def telegram_webhook():
             chat_id = str(data["message"]["chat"]["id"])
             user_text = data["message"]["text"]
             
-            # Generar respuesta (con memoria)
             response_text = get_gemini_response(user_text, chat_id)
 
-            # GUARDAR EN SUPABASE (IMPORTANTE: Guardamos el user_id para la memoria futura)
             if supabase:
                 try:
                     supabase.table('messages').insert({
-                        "user_id": chat_id, # <--- CLAVE PARA LA MEMORIA
+                        "user_id": chat_id,
                         "user_input": user_text, 
                         "bot_response": response_text, 
                         "platform": "telegram"
                     }).execute()
-                except Exception as e: print(f"Error guardando mensaje: {e}")
+                except: pass
 
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
                 "chat_id": chat_id, "text": response_text, "parse_mode": "Markdown"
