@@ -230,3 +230,4 @@ async def recibir_mensaje(datos: MensajeEntrada):
 def home():
     estado = "🟠 Modo Offline" if MODO_OFFLINE else "🟢 Online"
     return {"status": f"Barbería Activa - {estado}"}
+# prueba de subida
