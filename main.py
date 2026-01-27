@@ -1,13 +1,13 @@
 import os
 import random
+import requests # Necesario para responderle a Telegram
 from flask import Flask, request, jsonify
 import google.generativeai as genai
 from supabase import create_client, Client
 
-# Inicializamos Flask
 app = Flask(__name__)
 
-# --- 1. CONFIGURACIÓN DE VARIABLES DE ENTORNO ---
+# --- VARIABLES ---
 GEMINI_KEYS = [
     os.environ.get("GEMINI_API_KEY_1"),
     os.environ.get("GEMINI_API_KEY_2"),
@@ -17,8 +17,9 @@ VALID_GEMINI_KEYS = [key for key in GEMINI_KEYS if key]
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") # <--- NUEVA VARIABLE
 
-# --- 2. CONEXIÓN A SUPABASE ---
+# --- CONFIGURACIÓN ---
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -26,56 +27,62 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         print(f"⚠️ Error Supabase: {e}")
 
-# --- 3. RUTAS ---
+# --- RUTAS ---
 
 @app.route('/', methods=['GET'])
 def home():
-    """Verificación de estado del bot"""
-    return jsonify({
-        "status": "online",
-        "message": "Barbería Bot activo con Gemini 2.5 Flash 🚀"
-    })
+    return jsonify({"status": "online", "bot": "Telegram Ready ✈️"})
 
-@app.route('/chat', methods=['POST'])
-def chat():
+# Ruta para Telegram (Webhook)
+@app.route('/telegram', methods=['POST'])
+def telegram_webhook():
     try:
+        # 1. Recibir el mensaje de Telegram
         data = request.json
-        user_message = data.get('message')
+        
+        # Verificamos si es un mensaje de texto real
+        if "message" not in data or "text" not in data["message"]:
+            return jsonify({"status": "ignored"}), 200
 
-        if not user_message:
-            return jsonify({"error": "No se recibió ningún mensaje"}), 400
+        chat_id = data["message"]["chat"]["id"]
+        user_text = data["message"]["text"]
 
+        # 2. Consultar a Gemini (Tu lógica actual)
         if not VALID_GEMINI_KEYS:
-            return jsonify({"error": "No hay API Keys configuradas en el servidor"}), 500
-        
-        # Selección aleatoria de Key para balancear la cuota
-        selected_key = random.choice(VALID_GEMINI_KEYS)
-        genai.configure(api_key=selected_key)
-        
-        # --- MODELO DETECTADO POR LISTMODELS ---
-        model = genai.GenerativeModel('models/gemini-2.5-flash')
-        
-        response = model.generate_content(user_message)
-        bot_reply = response.text
+            bot_reply = "Error: El sistema está en mantenimiento (Sin API Keys)."
+        else:
+            selected_key = random.choice(VALID_GEMINI_KEYS)
+            genai.configure(api_key=selected_key)
+            model = genai.GenerativeModel('models/gemini-2.5-flash')
+            response = model.generate_content(user_text)
+            bot_reply = response.text
 
-        # Guardado automático en Supabase
+        # 3. Guardar en Supabase (Opcional)
         if supabase:
             try:
                 supabase.table('messages').insert({
-                    "user_input": user_message,
-                    "bot_response": bot_reply
+                    "user_input": user_text,
+                    "bot_response": bot_reply,
+                    "platform": "telegram" # Para saber que vino de ahí
                 }).execute()
-            except Exception as db_error:
-                print(f"⚠️ Error al guardar en la base de datos: {db_error}")
+            except:
+                pass
 
-        return jsonify({"response": bot_reply})
+        # 4. ENVIAR RESPUESTA A TELEGRAM
+        send_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": bot_reply,
+            "parse_mode": "Markdown" # Para que se vea bonito con negritas
+        }
+        requests.post(send_url, json=payload)
+
+        return jsonify({"status": "sent"}), 200
 
     except Exception as e:
-        print(f"❌ Error en la petición: {str(e)}")
+        print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- 4. ARRANQUE DEL SERVIDOR ---
 if __name__ == '__main__':
-    # Configuración específica para el puerto de Render
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
