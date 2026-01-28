@@ -96,21 +96,26 @@ def gestionar_reserva(datos, chat_id):
 
 def gestionar_cancelacion(datos, chat_id):
     try:
-        fecha = datos.get("fecha_hora")
+        fecha = datos.get("fecha_hora") # El bot manda "2026-01-29 08:00"
         cliente_id = obtener_id_cliente(chat_id)
         if not cliente_id: return "No encontré tu usuario."
         
         citas = supabase.table('citas').select("*").eq('cliente_id', cliente_id).execute()
         cita_id = None
+        
         for c in citas.data:
-            if c['fecha_hora'].startswith(fecha):
+            # --- CORRECCIÓN AQUÍ: Quitamos la T antes de comparar ---
+            fecha_db = c['fecha_hora'].replace("T", " ") # "2026-01-29 08:00..."
+            
+            if fecha_db.startswith(fecha):
                 cita_id = c['id']
                 break
         
         if cita_id:
             supabase.table('citas').delete().eq('id', cita_id).execute()
-            return f"🗑️ Cita del {fecha} cancelada."
-        return "⚠️ No encontré esa cita exacta."
+            return f"🗑️ Listo. Cita del {fecha} cancelada."
+        
+        return "⚠️ No encontré esa cita exacta (Verifica la hora)."
     except Exception as e: return f"Error cancelando: {str(e)}"
 
 def gestionar_reprogramacion(datos, chat_id):
@@ -122,7 +127,10 @@ def gestionar_reprogramacion(datos, chat_id):
         citas = supabase.table('citas').select("*").eq('cliente_id', cliente_id).execute()
         cita_id = None
         for c in citas.data:
-            if c['fecha_hora'].startswith(f_vieja):
+            # --- CORRECCIÓN AQUÍ TAMBIÉN ---
+            fecha_db = c['fecha_hora'].replace("T", " ")
+            
+            if fecha_db.startswith(f_vieja):
                 cita_id = c['id']
                 break
 
@@ -131,7 +139,7 @@ def gestionar_reprogramacion(datos, chat_id):
             return f"🔄 Cita movida al {f_nueva}."
         return "⚠️ No encontré la cita original."
     except Exception as e: return f"Error reprogramando: {str(e)}"
-
+    
 # --- 4. CEREBRO IA ---
 def get_gemini_response(user_text, chat_id):
     if not VALID_GEMINI_KEYS: return "⚠️ Error: Sin API Keys."
@@ -233,7 +241,7 @@ def enviar_recordatorios():
         return jsonify({"status": "Enviado", "cantidad": enviados}), 200
 
     except Exception as e: return jsonify({"error": str(e)}), 500
-    
+
 # --- 6. RUTAS PRINCIPALES ---
 @app.route('/', methods=['GET'])
 def home(): return jsonify({"status": "online", "features": ["Chat Vzla", "DB", "Recordatorios"]})
