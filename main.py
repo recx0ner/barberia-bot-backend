@@ -132,10 +132,11 @@ def get_gemini_response(user_text, chat_id):
             except: pass
         return texto
     except Exception as e: return f"Error: {e}"
-
-# --- 5. RUTA MAESTRA: RECORDATORIOS + REPORTE ADMIN ---
+    
+# --- 5. RUTA MAESTRA: RECORDATORIOS + REPORTE ADMIN (CORREGIDA) ---
 @app.route('/recordatorios', methods=['GET'])
 def enviar_recordatorios():
+    # Validación de seguridad
     secret = request.args.get('key')
     if secret != CRON_SECRET:
         return jsonify({"error": "Acceso denegado"}), 403
@@ -146,62 +147,67 @@ def enviar_recordatorios():
         manana = hoy + timedelta(days=1)
         fecha_busqueda = manana.strftime("%Y-%m-%d")
 
-        # Buscar citas
+        print(f"🔎 Buscando citas para: {fecha_busqueda}") # Log para debug
+
+        # Buscar citas (usamos ilike para coincidencia parcial de texto)
         response_citas = supabase.table('citas').select("*").ilike('fecha_hora', f"{fecha_busqueda}%").execute()
         citas = response_citas.data
 
         if not citas:
-            # Avisar al admin que tiene el día libre
+            mensaje_libre = f"🏖️ ¡Jefe! No hay citas para mañana ({fecha_busqueda})."
             if ADMIN_ID:
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-                    "chat_id": ADMIN_ID,
-                    "text": f"🏖️ ¡Jefe! No hay citas programadas para mañana ({fecha_busqueda}). Tómate un descanso.",
-                    "parse_mode": "Markdown"
+                    "chat_id": ADMIN_ID, "text": mensaje_libre
                 })
             return jsonify({"status": "Día libre", "fecha": fecha_busqueda})
 
-        # Preparamos el REPORTE PARA EL JEFE
+        # Preparamos el REPORTE
         resumen_admin = f"📅 *REPORTE PARA MAÑANA ({fecha_busqueda})*\n"
         resumen_admin += f"📊 Total Citas: {len(citas)}\n\n"
-        resumen_admin += "📋 *Agenda del día:*\n"
+        
+        enviados = 0
+        errores = 0
 
-        enviados_clientes = 0
-
-        # Ordenamos las citas por hora para que el reporte salga ordenado
-        citas_ordenadas = sorted(citas, key=lambda x: x['fecha_hora'])
-
-        for cita in citas_ordenadas:
+        for cita in citas:
             try:
-                cliente_id = cita['cliente_id']
-                hora_cita = cita['fecha_hora'].split(" ")[1]
+                # --- CORRECCIÓN DE FECHA (Maneja " " y "T") ---
+                fecha_raw = cita['fecha_hora']
+                # Reemplazamos la T por espacio para estandarizar
+                fecha_limpia = fecha_raw.replace("T", " ") 
+                # Ahora sí podemos hacer split seguro
+                hora_cita = fecha_limpia.split(" ")[1][:5] # Tomamos solo HH:MM
+                
                 servicio = cita.get('servicio', 'Cita')
+                cliente_id = cita['cliente_id']
 
                 # Datos del cliente
                 resp_cliente = supabase.table('cliente').select("nombre, telefono").eq('id', cliente_id).execute()
                 
                 if resp_cliente.data:
                     cliente = resp_cliente.data[0]
-                    nombre = cliente['nombre']
-                    chat_id = cliente['telefono']
+                    nombre = cliente.get('nombre', 'Cliente')
+                    chat_id = cliente.get('telefono')
 
-                    # 1. Agregar línea al reporte del jefe
+                    # Agregar al reporte del jefe
                     resumen_admin += f"⏰ *{hora_cita}* - {nombre} ({servicio})\n"
 
-                    # 2. Enviar recordatorio al cliente
-                    mensaje_cliente = (
-                        f"👋 ¡Hola {nombre}!\n"
-                        f"💈 Recordatorio: Tu cita es mañana a las *{hora_cita}*.\n"
-                        f"✂️ Servicio: {servicio}\n"
-                        f"¡Nos vemos!"
-                    )
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id, "text": mensaje_cliente, "parse_mode": "Markdown"
-                    })
-                    enviados_clientes += 1
+                    # Enviar al cliente
+                    if chat_id:
+                        mensaje_cliente = (
+                            f"👋 ¡Hola {nombre}!\n"
+                            f"💈 Recordatorio: Tu cita es mañana a las *{hora_cita}*.\n"
+                            f"✂️ Servicio: {servicio}\n"
+                            f"¡Te esperamos!"
+                        )
+                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+                            "chat_id": chat_id, "text": mensaje_cliente, "parse_mode": "Markdown"
+                        })
+                        enviados += 1
             except Exception as e:
-                print(f"Error procesando cita: {e}")
+                print(f"Error con una cita específica: {e}")
+                errores += 1
 
-        # ENVIAR REPORTE FINAL AL ADMIN
+        # ENVIAR REPORTE AL ADMIN (Solo si existe la variable)
         if ADMIN_ID:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
                 "chat_id": ADMIN_ID,
@@ -210,12 +216,13 @@ def enviar_recordatorios():
             })
 
         return jsonify({
-            "status": "Proceso finalizado",
-            "fecha": fecha_busqueda,
-            "reporte_enviado": True
-        })
+            "status": "Exito",
+            "enviados": enviados,
+            "errores": errores
+        }), 200
 
     except Exception as e:
+        print(f"🔥 ERROR FATAL: {str(e)}") # Esto saldrá en los logs de Render
         return jsonify({"error": str(e)}), 500
 
 # --- 6. RUTAS PRINCIPALES ---
