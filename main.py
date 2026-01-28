@@ -9,9 +9,9 @@ from supabase import create_client, Client
 
 app = Flask(__name__)
 
-# --- 1. PROMPT ESTRICTO (JSON FIRST) ---
+# --- 1. PROMPT ACTUALIZADO (BARBERIA ESTILAZO) ---
 BARBER_PROMPT = """
-Eres el asistente de la "Barbería El Corte Arrechísimo".
+Eres el asistente de la "Barberia Estilazo".
 Hoy es: {current_date} (Hora Venezuela).
 
 --- HISTORIAL RECIENTE ---
@@ -91,12 +91,13 @@ def gestionar_reserva(datos, chat_id):
             cliente_id = nuevo.data[0]['id']
             
         supabase.table('citas').insert({"cliente_id": cliente_id, "servicio": servicio, "fecha_hora": fecha}).execute()
-        return f"✅ ¡Listo {nombre}! Cita agendada para el {fecha}."
+        return f"✅ ¡Listo {nombre}! Cita agendada en Barberia Estilazo para el {fecha}."
     except Exception as e: return f"Error reservando: {str(e)}"
 
+# --- CORRECCIÓN "T" INCLUIDA EN CANCELAR Y REPROGRAMAR ---
 def gestionar_cancelacion(datos, chat_id):
     try:
-        fecha = datos.get("fecha_hora") # El bot manda "2026-01-29 08:00"
+        fecha = datos.get("fecha_hora")
         cliente_id = obtener_id_cliente(chat_id)
         if not cliente_id: return "No encontré tu usuario."
         
@@ -104,18 +105,16 @@ def gestionar_cancelacion(datos, chat_id):
         cita_id = None
         
         for c in citas.data:
-            # --- CORRECCIÓN AQUÍ: Quitamos la T antes de comparar ---
-            fecha_db = c['fecha_hora'].replace("T", " ") # "2026-01-29 08:00..."
-            
+            # Quitamos la T para comparar
+            fecha_db = str(c['fecha_hora']).replace("T", " ")
             if fecha_db.startswith(fecha):
                 cita_id = c['id']
                 break
         
         if cita_id:
             supabase.table('citas').delete().eq('id', cita_id).execute()
-            return f"🗑️ Listo. Cita del {fecha} cancelada."
-        
-        return "⚠️ No encontré esa cita exacta (Verifica la hora)."
+            return f"🗑️ Cita del {fecha} cancelada."
+        return "⚠️ No encontré esa cita exacta."
     except Exception as e: return f"Error cancelando: {str(e)}"
 
 def gestionar_reprogramacion(datos, chat_id):
@@ -127,9 +126,8 @@ def gestionar_reprogramacion(datos, chat_id):
         citas = supabase.table('citas').select("*").eq('cliente_id', cliente_id).execute()
         cita_id = None
         for c in citas.data:
-            # --- CORRECCIÓN AQUÍ TAMBIÉN ---
-            fecha_db = c['fecha_hora'].replace("T", " ")
-            
+            # Quitamos la T para comparar
+            fecha_db = str(c['fecha_hora']).replace("T", " ")
             if fecha_db.startswith(f_vieja):
                 cita_id = c['id']
                 break
@@ -139,8 +137,8 @@ def gestionar_reprogramacion(datos, chat_id):
             return f"🔄 Cita movida al {f_nueva}."
         return "⚠️ No encontré la cita original."
     except Exception as e: return f"Error reprogramando: {str(e)}"
-    
-# --- 4. CEREBRO IA ---
+
+# --- 4. CEREBRO IA (HORA VENEZUELA) ---
 def get_gemini_response(user_text, chat_id):
     if not VALID_GEMINI_KEYS: return "⚠️ Error: Sin API Keys."
     try:
@@ -148,6 +146,8 @@ def get_gemini_response(user_text, chat_id):
         genai.configure(api_key=selected_key)
         
         historial_str = obtener_historial_texto(chat_id)
+        
+        # Hora Venezuela -4
         fecha_dt = datetime.now() - timedelta(hours=4)
         fecha_hoy = fecha_dt.strftime("%Y-%m-%d %H:%M")
         
@@ -169,49 +169,41 @@ def get_gemini_response(user_text, chat_id):
         return texto
     except Exception as e: return f"Error técnico: {str(e)}"
 
-# --- 5. RECORDATORIOS (CORREGIDO PARA BASE DE DATOS TIPO FECHA) ---
+# --- 5. RECORDATORIOS (CON RANGO DE FECHAS) ---
 @app.route('/recordatorios', methods=['GET'])
 def enviar_recordatorios():
-    # 1. Seguridad
     secret = request.args.get('key')
     if secret != CRON_SECRET: return jsonify({"error": "Clave incorrecta"}), 403
     if not supabase: return jsonify({"error": "Sin conexión a DB"}), 500
 
     try:
-        # 2. Calcular el rango de búsqueda (MAÑANA COMPLETO)
-        # Hora Venezuela (-4)
+        # Calcular MAÑANA (Vzla)
         hoy = datetime.now() - timedelta(hours=4)
         manana = hoy + timedelta(days=1)
         
-        # Definimos inicio y fin del día
         fecha_inicio = manana.strftime("%Y-%m-%d 00:00:00")
         fecha_fin = manana.strftime("%Y-%m-%d 23:59:59")
-        fecha_simple = manana.strftime("%Y-%m-%d") # Solo para mostrar en el mensaje
+        fecha_simple = manana.strftime("%Y-%m-%d")
         
         print(f"🔎 Buscando citas entre: {fecha_inicio} y {fecha_fin}")
 
-        # 3. Consulta compatible con TIMESTAMP (Usamos gte y lte en lugar de ilike)
-        # gte = Mayor o igual que...
-        # lte = Menor o igual que...
         response = supabase.table('citas').select("*")\
             .gte('fecha_hora', fecha_inicio)\
             .lte('fecha_hora', fecha_fin)\
             .execute()
-            
         citas = response.data
 
         if not citas: return jsonify({"status": "Sin citas", "fecha": fecha_simple}), 200
 
-        # 4. Enviar Mensajes
-        resumen_admin = f"📅 *AGENDA {fecha_simple}*\n"
+        resumen_admin = f"📅 *AGENDA ESTILAZO {fecha_simple}*\n"
         enviados = 0
         
         for cita in citas:
             try:
                 if not cita.get('fecha_hora'): continue
                 
-                # Limpieza de fecha (Maneja formatos con T y sin T)
-                fecha_raw = str(cita['fecha_hora']) # Aseguramos que sea string
+                # Limpieza de fecha (Quitar T)
+                fecha_raw = str(cita['fecha_hora'])
                 hora = fecha_raw.replace("T", " ").split(" ")[1][:5]
                 
                 cliente_resp = supabase.table('cliente').select("nombre, telefono").eq('id', cita['cliente_id']).execute()
@@ -227,11 +219,10 @@ def enviar_recordatorios():
                     if chat_id:
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
                             "chat_id": chat_id, 
-                            "text": f"👋 Hola {nombre}, recuerda tu cita mañana a las {hora} ({servicio})."
+                            "text": f"👋 Hola {nombre}, recuerda tu cita mañana a las {hora} en Barberia Estilazo ({servicio})."
                         })
                         enviados += 1
-            except Exception as e:
-                print(f"Error enviando uno: {e}")
+            except: pass
 
         if ADMIN_ID:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
@@ -244,7 +235,7 @@ def enviar_recordatorios():
 
 # --- 6. RUTAS PRINCIPALES ---
 @app.route('/', methods=['GET'])
-def home(): return jsonify({"status": "online", "features": ["Chat Vzla", "DB", "Recordatorios"]})
+def home(): return jsonify({"status": "online", "barberia": "Estilazo 💈"})
 
 @app.route('/telegram', methods=['POST'])
 def telegram_webhook():
@@ -256,12 +247,10 @@ def telegram_webhook():
             resp = get_gemini_response(user_text, chat_id)
             guardar_mensaje_seguro(chat_id, user_text, resp)
             
-            # --- CORRECCIÓN CRÍTICA AQUÍ ---
-            # Eliminamos "parse_mode" para que Telegram no rechace el mensaje
+            # Sin parse_mode para evitar errores de formato
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
                 "chat_id": chat_id, 
                 "text": resp
-                # "parse_mode": "Markdown" <--- BORRADO A PROPÓSITO
             })
         return jsonify({"status": "sent"}), 200
     except Exception as e: return jsonify({"error": str(e)}), 500
