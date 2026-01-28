@@ -22,7 +22,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CRON_SECRET = os.environ.get("CRON_SECRET", "mi_clave_secreta_barberia")
-ADMIN_ID = os.environ.get("ADMIN_ID")
+ADMIN_ID = os.environ.get("ADMIN_ID") # Asegúrate de tener esta variable en Render
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -31,7 +31,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         print(f"⚠️ Error Conexión Supabase: {e}")
 
-# --- 2. PROMPT DE BARBERO (TEXTO) ---
+# --- 2. PROMPTS ---
 BARBER_PROMPT = """
 Eres el asistente de la "Barberia Estilazo".
 Hoy es: {current_date} (Hora Venezuela).
@@ -53,7 +53,6 @@ ACCIONES JSON:
 Si faltan datos, responde amable y pide lo que falta.
 """
 
-# --- 3. PROMPT DE CAJERO (IMÁGENES) ---
 CAJERO_PROMPT = """
 Analiza esta imagen. Es un comprobante de pago móvil o transferencia bancaria de Venezuela.
 Tu trabajo es extraer ÚNICAMENTE la siguiente información en formato JSON:
@@ -68,7 +67,7 @@ Si la imagen NO parece un comprobante de pago, responde con JSON: {"error": "no_
 NO digas nada más, solo el JSON.
 """
 
-# --- 4. FUNCIONES BD (Ayudantes) ---
+# --- 3. FUNCIONES BD (Ayudantes) ---
 def guardar_mensaje_seguro(chat_id, user_text, bot_text):
     if not supabase: return
     try:
@@ -96,7 +95,7 @@ def obtener_id_cliente(chat_id):
     except: pass
     return None
 
-# --- 5. LÓGICA DE CITAS ---
+# --- 4. GESTIÓN DE CITAS ---
 def gestionar_reserva(datos, chat_id):
     try:
         nombre = datos.get("nombre")
@@ -152,7 +151,99 @@ def gestionar_reprogramacion(datos, chat_id):
         return "⚠️ No encontré la cita original."
     except Exception as e: return f"Error reprogramando: {str(e)}"
 
-# --- 6. CEREBRO IA (TEXTO Y VISIÓN) ---
+# --- 5. GESTIÓN DE PAGOS (NUEVO: CON APROBACIÓN MANUAL) ---
+def gestionar_aprobacion_pago(referencia, admin_chat_id):
+    try:
+        # 1. Buscar pago
+        resp = supabase.table('pagos').select("*").eq('referencia', referencia).execute()
+        if not resp.data:
+            return "⚠️ No encontré ningún pago pendiente con esa referencia."
+        
+        pago = resp.data[0]
+        cliente_id = pago['cliente_id']
+        
+        # 2. Aprobar
+        supabase.table('pagos').update({"estado": "aprobado"}).eq('referencia', referencia).execute()
+        
+        # 3. Notificar al Cliente
+        resp_cliente = supabase.table('cliente').select("telefono, nombre").eq('id', cliente_id).execute()
+        if resp_cliente.data:
+            cliente = resp_cliente.data[0]
+            chat_id_cliente = cliente['telefono']
+            nombre = cliente['nombre']
+            
+            # Mensaje directo al cliente
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+                "chat_id": chat_id_cliente, 
+                "text": f"✅ ¡Listo {nombre}! Tu pago *{referencia}* ha sido verificado y aprobado. Nos vemos en la barbería.",
+                "parse_mode": "Markdown"
+            })
+            
+        return f"👍 Pago {referencia} aprobado y cliente notificado."
+        
+    except Exception as e: return f"Error aprobando: {str(e)}"
+
+def procesar_imagen_pago(file_id, chat_id):
+    try:
+        # Descarga
+        url_info = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
+        resp_info = requests.get(url_info).json()
+        if not resp_info.get("ok"): return "Error obteniendo imagen."
+        
+        file_path = resp_info["result"]["file_path"]
+        url_descarga = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        imagen_bytes = requests.get(url_descarga).content
+        
+        # Análisis Gemini
+        selected_key = random.choice(VALID_GEMINI_KEYS)
+        genai.configure(api_key=selected_key)
+        model = genai.GenerativeModel('models/gemini-2.5-flash')
+        
+        response = model.generate_content([
+            CAJERO_PROMPT,
+            {"mime_type": "image/jpeg", "data": imagen_bytes}
+        ])
+        
+        texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
+        datos = json.loads(texto_limpio)
+        
+        if datos.get("error"):
+            return "❌ Eso no parece un comprobante de pago válido."
+            
+        referencia = datos.get("referencia", "Desconocida")
+        monto = datos.get("monto", "N/A")
+        banco = datos.get("banco", "Desconocido")
+        
+        # Guardar en BD (PENDIENTE)
+        cliente_id = obtener_id_cliente(chat_id)
+        if not cliente_id:
+            nuevo = supabase.table('cliente').insert({"nombre": "Cliente Pagador", "telefono": str(chat_id)}).execute()
+            cliente_id = nuevo.data[0]['id']
+
+        supabase.table('pagos').insert({
+            "cliente_id": cliente_id, "referencia": referencia, "monto": monto, "banco": banco, "estado": "pendiente"
+        }).execute()
+        
+        # --- AVISO AL JEFE ---
+        if ADMIN_ID:
+            msg_admin = (
+                f"💰 *NUEVO PAGO PENDIENTE*\n"
+                f"Banco: {banco}\n"
+                f"Monto: {monto}\n"
+                f"Ref: `{referencia}`\n\n"
+                f"Para aprobar, responde:\n`/ok {referencia}`"
+            )
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+                "chat_id": ADMIN_ID, "text": msg_admin, "parse_mode": "Markdown"
+            })
+        
+        return f"⏳ ¡Pago recibido!\n🏦 Banco: {banco}\n🔢 Ref: *{referencia}*\n💰 Monto: {monto}\n\nLo he enviado a verificación manual. Te confirmaré en breve."
+
+    except Exception as e:
+        print(f"Error imagen: {e}")
+        return "⚠️ Error leyendo la imagen. Por favor escribe la referencia manualmente."
+
+# --- 6. CEREBRO IA (TEXTO) ---
 def get_gemini_response(user_text, chat_id):
     if not VALID_GEMINI_KEYS: return "⚠️ Error: Sin API Keys."
     try:
@@ -180,62 +271,7 @@ def get_gemini_response(user_text, chat_id):
         return texto
     except Exception as e: return f"Error técnico: {str(e)}"
 
-def procesar_imagen_pago(file_id, chat_id):
-    try:
-        # 1. Obtener URL de Telegram
-        url_info = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
-        resp_info = requests.get(url_info).json()
-        if not resp_info.get("ok"): return "Error obteniendo imagen."
-        
-        file_path = resp_info["result"]["file_path"]
-        url_descarga = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-        
-        # 2. Descargar
-        imagen_bytes = requests.get(url_descarga).content
-        
-        # 3. Analizar con Gemini Vision
-        selected_key = random.choice(VALID_GEMINI_KEYS)
-        genai.configure(api_key=selected_key)
-        model = genai.GenerativeModel('models/gemini-2.5-flash')
-        
-        response = model.generate_content([
-            CAJERO_PROMPT,
-            {"mime_type": "image/jpeg", "data": imagen_bytes}
-        ])
-        
-        # 4. Procesar Respuesta
-        texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
-        datos = json.loads(texto_limpio)
-        
-        if datos.get("error"):
-            return "❌ Eso no parece un comprobante de pago válido."
-            
-        referencia = datos.get("referencia", "Desconocida")
-        monto = datos.get("monto", "N/A")
-        banco = datos.get("banco", "Desconocido")
-        
-        # 5. Guardar en Supabase
-        cliente_id = obtener_id_cliente(chat_id)
-        if not cliente_id:
-            nuevo = supabase.table('cliente').insert({"nombre": "Cliente Pagador", "telefono": str(chat_id)}).execute()
-            cliente_id = nuevo.data[0]['id']
-
-        supabase.table('pagos').insert({
-            "cliente_id": cliente_id,
-            "referencia": referencia,
-            "monto": monto,
-            "banco": banco,
-            "estado": "pendiente"
-        }).execute()
-        
-        return f"💸 ¡Pago recibido!\n🏦 Banco: {banco}\n🔢 Ref: *{referencia}*\n💰 Monto: {monto}\n\nLo verificaré en breve."
-
-    except Exception as e:
-        print(f"Error procesando imagen: {e}")
-        return "⚠️ Recibí la imagen pero no pude leer los datos. Por favor escribe la referencia manualmente."
-
-# --- 7. RUTAS PRINCIPALES (WEBHOOKS Y CRON) ---
-
+# --- 7. RUTAS PRINCIPALES ---
 @app.route('/telegram', methods=['POST'])
 def telegram_webhook():
     try:
@@ -243,7 +279,7 @@ def telegram_webhook():
         if "message" in data:
             chat_id = str(data["message"]["chat"]["id"])
             
-            # CASO A: FOTO (PAGO)
+            # A. FOTO (PAGO)
             if "photo" in data["message"]:
                 file_id = data["message"]["photo"][-1]["file_id"]
                 resp = procesar_imagen_pago(file_id, chat_id)
@@ -251,15 +287,25 @@ def telegram_webhook():
                     "chat_id": chat_id, "text": resp, "parse_mode": "Markdown"
                 })
 
-            # CASO B: TEXTO (CHAT)
+            # B. TEXTO (CHAT O COMANDO)
             elif "text" in data["message"]:
                 user_text = data["message"]["text"]
-                resp = get_gemini_response(user_text, chat_id)
-                guardar_mensaje_seguro(chat_id, user_text, resp)
-                # Parse mode eliminado para seguridad en chat libre
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id, "text": resp
-                })
+                
+                # --- COMANDO DE APROBACIÓN (SOLO JEFE) ---
+                if user_text.startswith("/ok ") and str(chat_id) == str(ADMIN_ID):
+                    referencia = user_text.split(" ")[1]
+                    resp = gestionar_aprobacion_pago(referencia, chat_id)
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+                        "chat_id": chat_id, "text": resp
+                    })
+                
+                # --- CHAT NORMAL ---
+                else:
+                    resp = get_gemini_response(user_text, chat_id)
+                    guardar_mensaje_seguro(chat_id, user_text, resp)
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+                        "chat_id": chat_id, "text": resp
+                    })
 
         return jsonify({"status": "sent"}), 200
     except Exception as e: return jsonify({"error": str(e)}), 500
@@ -271,23 +317,16 @@ def enviar_recordatorios():
     if not supabase: return jsonify({"error": "Sin conexión a DB"}), 500
 
     try:
-        # Calcular MAÑANA (Vzla)
         hoy = datetime.now() - timedelta(hours=4)
         manana = hoy + timedelta(days=1)
-        
         fecha_inicio = manana.strftime("%Y-%m-%d 00:00:00")
         fecha_fin = manana.strftime("%Y-%m-%d 23:59:59")
         fecha_simple = manana.strftime("%Y-%m-%d")
         
-        print(f"🔎 Buscando citas entre: {fecha_inicio} y {fecha_fin}")
-
-        response = supabase.table('citas').select("*")\
-            .gte('fecha_hora', fecha_inicio)\
-            .lte('fecha_hora', fecha_fin)\
-            .execute()
+        response = supabase.table('citas').select("*").gte('fecha_hora', fecha_inicio).lte('fecha_hora', fecha_fin).execute()
         citas = response.data
 
-        if not citas: return jsonify({"status": "Sin citas", "fecha": fecha_simple}), 200
+        if not citas: return jsonify({"status": "Sin citas"}), 200
 
         resumen_admin = f"📅 *AGENDA ESTILAZO {fecha_simple}*\n"
         enviados = 0
@@ -295,24 +334,18 @@ def enviar_recordatorios():
         for cita in citas:
             try:
                 if not cita.get('fecha_hora'): continue
-                
                 fecha_raw = str(cita['fecha_hora'])
                 hora = fecha_raw.replace("T", " ").split(" ")[1][:5]
-                
                 cliente_resp = supabase.table('cliente').select("nombre, telefono").eq('id', cita['cliente_id']).execute()
                 
                 if cliente_resp.data:
                     cliente = cliente_resp.data[0]
-                    nombre = cliente.get('nombre', 'Cliente')
                     chat_id = cliente.get('telefono')
-                    servicio = cita.get('servicio', 'Cita')
-                    
-                    resumen_admin += f"⏰ {hora} - {nombre}\n"
-
+                    resumen_admin += f"⏰ {hora} - {cliente.get('nombre')}\n"
                     if chat_id:
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
                             "chat_id": chat_id, 
-                            "text": f"👋 Hola {nombre}, recuerda tu cita mañana a las {hora} en Barberia Estilazo ({servicio})."
+                            "text": f"👋 Hola, recuerda tu cita mañana a las {hora} en Barberia Estilazo."
                         })
                         enviados += 1
             except: pass
@@ -328,11 +361,7 @@ def enviar_recordatorios():
 
 @app.route('/', methods=['GET'])
 def home(): 
-    return jsonify({
-        "status": "online", 
-        "barberia": "Estilazo 💈", 
-        "features": ["Chat", "Vision Pagos", "Recordatorios"]
-    })
+    return jsonify({"status": "online", "barberia": "Estilazo 💈"})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
