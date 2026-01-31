@@ -17,10 +17,25 @@ EVO_URL = os.environ.get("EVOLUTION_URL")
 EVO_KEY = os.environ.get("EVOLUTION_APIKEY")
 EVO_INST = os.environ.get("EVOLUTION_INSTANCE")
 
+# --- UTILIDADES DE BÚSQUEDA ---
+
+def buscar_llave(data, llave):
+    """Busca una llave específica en todo el JSON, sin importar la profundidad."""
+    if isinstance(data, dict):
+        if llave in data: return data[llave]
+        for v in data.values():
+            res = buscar_llave(v, llave)
+            if res: return res
+    elif isinstance(data, list):
+        for item in data:
+            res = buscar_llave(item, llave)
+            if res: return res
+    return None
+
 def get_gemini_response(user_text):
     try:
         client = genai.Client(api_key=random.choice(VALID_KEYS))
-        instruction = f"{BUSINESS_CONTEXT}\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        instruction = f"{BUSINESS_CONTEXT}\nFecha: {datetime.now().strftime('%Y-%m-%d')}"
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             config={'system_instruction': instruction},
@@ -29,63 +44,64 @@ def get_gemini_response(user_text):
         return response.text.strip()
     except Exception as e:
         print(f"❌ Error Gemini: {e}")
-        return "Lo siento, tuve un pequeño problema técnico. ¿Me repites?"
+        return "¡Ups! Mi horno mental falló. ¿Me repites?"
+
+# --- WEBHOOK PRINCIPAL ---
 
 @app.route('/whatsapp', methods=['POST'])
 def webhook():
     payload = request.json
-    print(f"--- NUEVO PAYLOAD DETECTADO ---")
+    print("--- NUEVO PAYLOAD DETECTADO ---")
     
+    # Imprimimos las llaves principales para diagnóstico rápido
+    print(f"Llaves en el paquete: {list(payload.keys())}")
+
     try:
-        # 1. BUSCADOR DINÁMICO DE DATOS (No importa dónde los esconda Evolution)
-        # Intentamos obtenerlo de 'data' o de la raíz directamente
-        content = payload.get('data') if payload.get('data') else payload
+        # 1. BÚSQUEDA AGRESIVA DEL REMOTEPID (Número)
+        remote_jid = buscar_llave(payload, 'remoteJid')
         
-        # Evitar respondernos a nosotros mismos
-        if content.get('key', {}).get('fromMe') is True:
+        # 2. EVITAR AUTO-RESPUESTAS
+        from_me = buscar_llave(payload, 'fromMe')
+        if from_me is True:
             return jsonify({"status": "ignored_self"}), 200
 
-        # Extraer el número (remoteJid)
-        remote_jid = content.get('key', {}).get('remoteJid', '')
         if not remote_jid:
-            print("⚠️ No se encontró remoteJid en el payload.")
-            return jsonify({"status": "no_jid"}), 200
-        
-        numero = remote_jid.split('@')[0]
+            print("⚠️ No se encontró remoteJid. Puede que no sea un mensaje de texto.")
+            return jsonify({"status": "no_jid_detected"}), 200
 
-        # Extraer el texto (buscamos en todas las ubicaciones posibles)
-        msg_obj = content.get('message', {})
+        numero = str(remote_jid).split('@')[0]
+
+        # 3. BÚSQUEDA AGRESIVA DEL TEXTO
         texto_usuario = (
-            msg_obj.get('conversation') or 
-            msg_obj.get('extendedTextMessage', {}).get('text') or 
-            content.get('text') or ""
+            buscar_llave(payload, 'conversation') or 
+            buscar_llave(payload, 'text') or 
+            buscar_llave(payload, 'displayText') or ""
         )
 
         if not texto_usuario:
-            print("⚠️ No se pudo extraer texto del mensaje.")
+            print(f"⚠️ Mensaje de {numero} sin texto legible.")
             return jsonify({"status": "no_text"}), 200
 
-        print(f"📩 Mensaje de {numero}: {texto_usuario}")
+        print(f"📩 Procesando: '{texto_usuario}' de {numero}")
 
-        # 2. GENERAR RESPUESTA
+        # 4. GENERAR Y ENVIAR RESPUESTA
         respuesta_ia = get_gemini_response(texto_usuario)
-
-        # 3. ENVIAR A WHATSAPP
+        
         url_send = f"{EVO_URL}/message/sendText/{EVO_INST}"
         headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
-        send_payload = {"number": numero, "textMessage": {"text": respuesta_ia}}
+        send_data = {"number": numero, "textMessage": {"text": respuesta_ia}}
         
-        res = requests.post(url_send, headers=headers, json=send_payload, timeout=10)
+        res = requests.post(url_send, headers=headers, json=send_data, timeout=12)
         print(f"📤 Evolution Status: {res.status_code}")
 
-        # 4. GUARDAR EN SUPABASE
+        # 5. GUARDADO EN SUPABASE
         try:
             supabase.table('messages').insert({
                 "user_id": numero, 
                 "user_input": texto_usuario,
                 "bot_response": respuesta_ia
             }).execute()
-            print("✅ Supabase actualizado.")
+            print("✅ Supabase sincronizado.")
         except Exception as e:
             print(f"🔥 Error Supabase: {e}")
 
@@ -96,7 +112,7 @@ def webhook():
         return jsonify({"status": "error"}), 500
 
 @app.route('/')
-def health(): return "Bot Online 🍕", 200
+def health(): return "Pizza & Barber Bot Online 🚀", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=PORT)
