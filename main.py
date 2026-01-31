@@ -1,76 +1,78 @@
-import os, random, json, requests, traceback, time
-from datetime import datetime
+import os, random, requests, traceback
 from flask import Flask, request, jsonify
 from google import genai 
 from supabase import create_client
 
 app = Flask(__name__)
 
-# --- 1. CONFIGURACIÓN ---
-PORT = int(os.environ.get("PORT", 10000))
-BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres un asistente de pizzería/barbería.")
+# --- CONFIGURACIÓN ---
+# Meta Cloud API
+META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
+META_PHONE_ID = os.environ.get("META_PHONE_ID")
+
+# Evolution API
+EVO_URL = os.environ.get("EVOLUTION_URL", "").strip().rstrip('/')
+EVO_KEY = os.environ.get("EVOLUTION_APIKEY")
+EVO_INST = os.environ.get("EVOLUTION_INSTANCE")
+
+# IA y Base de Datos
+BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres un asistente de pizzería.")
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
 VALID_KEYS = [k for k in GEMINI_KEYS if k]
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-# Variables de Evolution
-EVO_URL = os.environ.get("EVOLUTION_URL", "").strip().rstrip('/')
-EVO_KEY = os.environ.get("EVOLUTION_APIKEY", "").strip()
-EVO_INST = os.environ.get("EVOLUTION_INSTANCE", "").strip()
+# --- FUNCIONES DE ENVÍO ---
 
-# --- 2. FUNCIÓN DE ENVÍO CORREGIDA (v1/Simple) ---
+def enviar_respuesta(canal, numero, texto):
+    if canal == "META":
+        url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
+        headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
+        payload = {"messaging_product": "whatsapp", "to": numero, "type": "text", "text": {"body": texto}}
+        res = requests.post(url, headers=headers, json=payload)
+        print(f"📤 Respuesta enviada por META (Status: {res.status_code})")
+    
+    elif canal == "EVOLUTION":
+        url = f"{EVO_URL}/message/sendText/{EVO_INST}"
+        headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
+        payload = {"number": numero, "text": texto}
+        res = requests.post(url, headers=headers, json=payload)
+        print(f"📤 Respuesta enviada por EVOLUTION (Status: {res.status_code})")
 
-def enviar_whatsapp(numero, texto):
-    url_send = f"{EVO_URL}/message/sendText/{EVO_INST}"
-    
-    # CAMBIO CLAVE: Enviamos "text" directamente para corregir el Error 400
-    payload = {
-        "number": numero,
-        "text": texto  
-    }
-    
-    headers = {
-        "apikey": EVO_KEY, 
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        print(f"🚀 ENVIANDO A: {url_send} | INSTANCIA: {EVO_INST}")
-        res = requests.post(url_send, headers=headers, json=payload, timeout=20)
-        
-        print(f"📤 STATUS EVOLUTION: {res.status_code}")
-        
-        if res.status_code in [200, 201]:
-            return True
-        else:
-            print(f"⚠️ ERROR DE PAYLOAD: {res.text}")
-            return False
-    except Exception as e:
-        print(f"🔥 FALLO DE CONEXIÓN: {e}")
-        return False
-
-# --- 3. WEBHOOK ---
+# --- WEBHOOK HÍBRIDO ---
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
+    # Verificación para Meta
     if request.method == 'GET':
-        challenge = request.args.get('hub.challenge')
-        return challenge, 200 if challenge else ("OK", 200)
+        return request.args.get("hub.challenge"), 200
 
     payload = request.json
+    canal = None
+    numero = None
+    texto_usuario = None
+
     try:
-        # Extraemos datos del formato Meta Cloud (tu log actual)
-        try:
-            msg_data = payload['entry'][0]['changes'][0]['value']['messages'][0]
+        # 1. Detectar si el mensaje viene de META
+        if 'object' in payload and 'entry' in payload:
+            canal = "META"
+            msg_data = payload['entry'][0]['changes'][0]['value'].get('messages', [{}])[0]
             numero = msg_data.get('from')
             texto_usuario = msg_data.get('text', {}).get('body')
-        except:
-            numero, texto_usuario = None, None
 
+        # 2. Detectar si viene de EVOLUTION (Si no es Meta)
+        elif not canal:
+            canal = "EVOLUTION"
+            data = payload.get('data', payload)
+            if data.get('key', {}).get('fromMe') is True: return jsonify({"status": "ignored"}), 200
+            numero = data.get('key', {}).get('remoteJid', '').split('@')[0]
+            texto_usuario = data.get('message', {}).get('conversation') or \
+                            data.get('message', {}).get('extendedTextMessage', {}).get('text')
+
+        # 3. Procesar y Responder
         if numero and texto_usuario:
-            print(f"📩 Mensaje de {numero}: {texto_usuario}")
+            print(f"📩 Mensaje recibido por {canal} de {numero}: {texto_usuario}")
             
-            # 1. IA
+            # Generar IA
             client = genai.Client(api_key=random.choice(VALID_KEYS))
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
@@ -78,28 +80,22 @@ def webhook():
                 contents=texto_usuario
             )
             respuesta_ia = response.text.strip()
-            
-            # 2. ENVIAR (Con el nuevo formato de texto)
-            enviado = enviar_whatsapp(numero, respuesta_ia)
-            
-            # 3. SUPABASE (Ya está funcionando perfecto)
-            try:
-                supabase.table('messages').insert({
-                    "user_id": numero, 
-                    "user_input": texto_usuario,
-                    "bot_response": respuesta_ia
-                }).execute()
-                print(f"✅ Supabase OK. ¿Enviado?: {enviado}")
-            except Exception as e:
-                print(f"🔥 Error Supabase: {e}")
-            
+
+            # Enviar por el mismo canal de entrada
+            enviar_respuesta(canal, numero, respuesta_ia)
+
+            # Guardar en Supabase (Centralizado)
+            supabase.table('messages').insert({
+                "user_id": numero, 
+                "user_input": texto_usuario,
+                "bot_response": respuesta_ia,
+                "platform": canal
+            }).execute()
+
         return jsonify({"status": "ok"}), 200
     except:
         traceback.print_exc()
         return jsonify({"status": "error"}), 500
 
-@app.route('/')
-def health(): return "Bot Operativo 🚀", 200
-
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
