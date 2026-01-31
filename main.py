@@ -86,30 +86,42 @@ def enviar_whatsapp(numero, texto):
 def webhook():
     try:
         data = request.json
-        if data.get("type") != "MESSAGES_UPSERT": return jsonify({"status": "ok"}), 200
+        # Ajuste: Evolution usa "messages.upsert" o "MESSAGES_UPSERT" según config
+        event_type = data.get("type", "").lower() 
+        if event_type != "messages.upsert": 
+            return jsonify({"status": "ignored_event"}), 200
         
-        msg = data['data']
-        if msg.get('key', {}).get('fromMe'): return jsonify({"status": "ok"}), 200
+        msg_data = data.get('data', {})
+        # Evitar que el bot se responda a sí mismo
+        if msg_data.get('key', {}).get('fromMe'): 
+            return jsonify({"status": "ok"}), 200
         
-        numero = msg['key']['remoteJid'].split('@')[0]
-        texto = (msg.get('message', {}).get('conversation') or 
-                 msg.get('message', {}).get('extendedTextMessage', {}).get('text') or "")
+        numero = msg_data['key']['remoteJid'].split('@')[0]
         
+        # Extraer texto de forma más robusta
+        message_content = msg_data.get('message', {})
+        texto = (message_content.get('conversation') or 
+                 message_content.get('extendedTextMessage', {}).get('text') or "")
+
         if texto:
-            print(f"📩 Recibido: {texto}")
-            respuesta = get_gemini_3_response(texto, numero)
+            print(f"📩 Procesando mensaje de {numero}: {texto}")
+            # Sugerencia: Asegúrate que 'gemini-2.5-flash' es el ID correcto
+            respuesta = get_gemini_3_response(texto, numero) 
             enviar_whatsapp(numero, respuesta)
             
-            # Guardar en Supabase
-            supabase.table('messages').insert({
-                "user_id": numero, "user_input": texto, "bot_response": respuesta, "platform": "whatsapp"
-            }).execute()
+            # Registro en Supabase
+            try:
+                supabase.table('messages').insert({
+                    "user_id": numero, 
+                    "user_input": texto, 
+                    "bot_response": respuesta, 
+                    "platform": "whatsapp"
+                }).execute()
+                print("✅ Guardado en Supabase")
+            except Exception as e:
+                print(f"🔥 Error Supabase: {e}")
             
         return jsonify({"status": "success"}), 200
-    except:
+    except Exception as e:
         traceback.print_exc()
-        return "Error", 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        return jsonify({"error": str(e)}), 500
