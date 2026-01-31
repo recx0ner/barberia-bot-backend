@@ -17,10 +17,9 @@ EVO_URL = os.environ.get("EVOLUTION_URL")
 EVO_KEY = os.environ.get("EVOLUTION_APIKEY")
 EVO_INST = os.environ.get("EVOLUTION_INSTANCE")
 
-# --- UTILIDADES DE BÚSQUEDA ---
+# --- FUNCIONES DE APOYO ---
 
 def buscar_llave(data, llave):
-    """Busca una llave específica en todo el JSON, sin importar la profundidad."""
     if isinstance(data, dict):
         if llave in data: return data[llave]
         for v in data.values():
@@ -35,7 +34,7 @@ def buscar_llave(data, llave):
 def get_gemini_response(user_text):
     try:
         client = genai.Client(api_key=random.choice(VALID_KEYS))
-        instruction = f"{BUSINESS_CONTEXT}\nFecha: {datetime.now().strftime('%Y-%m-%d')}"
+        instruction = f"{BUSINESS_CONTEXT}\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             config={'system_instruction': instruction},
@@ -44,66 +43,78 @@ def get_gemini_response(user_text):
         return response.text.strip()
     except Exception as e:
         print(f"❌ Error Gemini: {e}")
-        return "¡Ups! Mi horno mental falló. ¿Me repites?"
+        return "Lo siento, tuve un pequeño problema técnico. ¿Me repites?"
 
-# --- WEBHOOK PRINCIPAL ---
+# --- WEBHOOK ---
 
-@app.route('/whatsapp', methods=['POST'])
+@app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
+    # Soporte para Verificación de Webhook de Meta (por si acaso)
+    if request.method == 'GET':
+        mode = request.args.get('hub.mode')
+        token = request.args.get('hub.verify_token')
+        challenge = request.args.get('hub.challenge')
+        if mode and token:
+            return challenge, 200
+
     payload = request.json
     print("--- NUEVO PAYLOAD DETECTADO ---")
     
-    # Imprimimos las llaves principales para diagnóstico rápido
-    print(f"Llaves en el paquete: {list(payload.keys())}")
+    numero = None
+    texto_usuario = None
 
     try:
-        # 1. BÚSQUEDA AGRESIVA DEL REMOTEPID (Número)
-        remote_jid = buscar_llave(payload, 'remoteJid')
-        
-        # 2. EVITAR AUTO-RESPUESTAS
-        from_me = buscar_llave(payload, 'fromMe')
-        if from_me is True:
-            return jsonify({"status": "ignored_self"}), 200
+        # 1. CASO A: Formato Meta Cloud API (Tus logs actuales)
+        if 'object' in payload and 'entry' in payload:
+            print("Detectado formato Meta Cloud API")
+            try:
+                entry = payload['entry'][0]
+                changes = entry.get('changes', [{}])[0]
+                value = changes.get('value', {})
+                if 'messages' in value:
+                    msg = value['messages'][0]
+                    numero = msg.get('from')
+                    texto_usuario = msg.get('text', {}).get('body') or msg.get('button', {}).get('text')
+            except: pass
 
-        if not remote_jid:
-            print("⚠️ No se encontró remoteJid. Puede que no sea un mensaje de texto.")
-            return jsonify({"status": "no_jid_detected"}), 200
+        # 2. CASO B: Formato Evolution API o Búsqueda Genérica
+        if not numero:
+            remote_jid = buscar_llave(payload, 'remoteJid')
+            if remote_jid:
+                numero = str(remote_jid).split('@')[0]
+                texto_usuario = (buscar_llave(payload, 'conversation') or 
+                                 buscar_llave(payload, 'text') or 
+                                 buscar_llave(payload, 'displayText'))
 
-        numero = str(remote_jid).split('@')[0]
+        # 3. PROCESAMIENTO SI HAY DATOS
+        if numero and texto_usuario:
+            # Evitar auto-respuestas
+            if buscar_llave(payload, 'fromMe') is True:
+                return jsonify({"status": "ignored_self"}), 200
 
-        # 3. BÚSQUEDA AGRESIVA DEL TEXTO
-        texto_usuario = (
-            buscar_llave(payload, 'conversation') or 
-            buscar_llave(payload, 'text') or 
-            buscar_llave(payload, 'displayText') or ""
-        )
+            print(f"📩 Mensaje de {numero}: {texto_usuario}")
+            respuesta_ia = get_gemini_response(texto_usuario)
 
-        if not texto_usuario:
-            print(f"⚠️ Mensaje de {numero} sin texto legible.")
-            return jsonify({"status": "no_text"}), 200
+            # Enviar vía Evolution API
+            url_send = f"{EVO_URL}/message/sendText/{EVO_INST}"
+            headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
+            send_data = {"number": numero, "textMessage": {"text": respuesta_ia}}
+            
+            res = requests.post(url_send, headers=headers, json=send_data, timeout=10)
+            print(f"📤 Evolution Status: {res.status_code}")
 
-        print(f"📩 Procesando: '{texto_usuario}' de {numero}")
-
-        # 4. GENERAR Y ENVIAR RESPUESTA
-        respuesta_ia = get_gemini_response(texto_usuario)
-        
-        url_send = f"{EVO_URL}/message/sendText/{EVO_INST}"
-        headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
-        send_data = {"number": numero, "textMessage": {"text": respuesta_ia}}
-        
-        res = requests.post(url_send, headers=headers, json=send_data, timeout=12)
-        print(f"📤 Evolution Status: {res.status_code}")
-
-        # 5. GUARDADO EN SUPABASE
-        try:
-            supabase.table('messages').insert({
-                "user_id": numero, 
-                "user_input": texto_usuario,
-                "bot_response": respuesta_ia
-            }).execute()
-            print("✅ Supabase sincronizado.")
-        except Exception as e:
-            print(f"🔥 Error Supabase: {e}")
+            # Guardar en Supabase
+            try:
+                supabase.table('messages').insert({
+                    "user_id": numero, 
+                    "user_input": texto_usuario,
+                    "bot_response": respuesta_ia
+                }).execute()
+                print("✅ Supabase sincronizado.")
+            except Exception as e:
+                print(f"🔥 Error Supabase: {e}")
+        else:
+            print("⚠️ El paquete no contenía un mensaje de texto procesable.")
 
         return jsonify({"status": "success"}), 200
 
@@ -112,7 +123,7 @@ def webhook():
         return jsonify({"status": "error"}), 500
 
 @app.route('/')
-def health(): return "Pizza & Barber Bot Online 🚀", 200
+def health(): return "Bot Multi-Formato Activo 🚀", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=PORT)
