@@ -8,20 +8,20 @@ app = Flask(__name__)
 
 # --- CONFIGURACIÓN ---
 PORT = int(os.environ.get("PORT", 10000))
-BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres un asistente divertido de una pizzería.")
+BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres un asistente de pizzería.")
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
 VALID_KEYS = [k for k in GEMINI_KEYS if k]
 
+# Conexiones
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
-
-EVOLUTION_URL = os.environ.get("EVOLUTION_URL")
-EVOLUTION_APIKEY = os.environ.get("EVOLUTION_APIKEY")
-EVOLUTION_INSTANCE = os.environ.get("EVOLUTION_INSTANCE")
+EVO_URL = os.environ.get("EVOLUTION_URL")
+EVO_KEY = os.environ.get("EVOLUTION_APIKEY")
+EVO_INST = os.environ.get("EVOLUTION_INSTANCE")
 
 def get_gemini_response(user_text):
     try:
         client = genai.Client(api_key=random.choice(VALID_KEYS))
-        instruction = f"{BUSINESS_CONTEXT}\nFecha actual: {datetime.now().strftime('%Y-%m-%d')}"
+        instruction = f"{BUSINESS_CONTEXT}\nFecha: {datetime.now().strftime('%Y-%m-%d')}"
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             config={'system_instruction': instruction},
@@ -29,56 +29,65 @@ def get_gemini_response(user_text):
         )
         return response.text.strip()
     except Exception as e:
-        return f"Error en IA: {str(e)}"
+        print(f"❌ Error en Gemini: {e}")
+        return "Lo siento, tuve un problema técnico."
 
 @app.route('/whatsapp', methods=['POST'])
 def webhook():
+    # 1. CAPTURA TOTAL: Esto aparecerá sí o sí en tus logs
+    data = request.json
+    print(f"--- NUEVO MENSAJE RECIBIDO ---")
+    print(json.dumps(data, indent=2)) 
+
     try:
-        data = request.json
-        # ESTO ES CLAVE: Ver que está llegando realmente
-        print(f"DEBUG: Datos recibidos -> {json.dumps(data)}")
-
-        # Intentamos obtener el mensaje sin importar la estructura exacta
+        # 2. EXTRAER DATOS (Versión ultra-compatible)
         msg_data = data.get('data', {})
-        if msg_data.get('key', {}).get('fromMe'):
-            return jsonify({"status": "ignoring_self"}), 200
+        if not msg_data: 
+            print("⚠️ El JSON no tiene la llave 'data'. Revisa la config de Evolution.")
+            return jsonify({"status": "no_data"}), 200
 
+        # Evitar bucles
+        if msg_data.get('key', {}).get('fromMe'):
+            return jsonify({"status": "skipped_self"}), 200
+
+        # Extraer número y texto
         numero = msg_data.get('key', {}).get('remoteJid', '').split('@')[0]
         msg_body = msg_data.get('message', {})
         texto_usuario = (msg_body.get('conversation') or 
                          msg_body.get('extendedTextMessage', {}).get('text') or "")
 
-        if texto_usuario and numero:
-            print(f"📩 Procesando: {texto_usuario} de {numero}")
+        if texto_usuario:
+            print(f"📩 Procesando mensaje: '{texto_usuario}' de {numero}")
             
-            respuesta_ia = get_gemini_response(texto_usuario)
+            respuesta = get_gemini_response(texto_usuario)
             
-            # Enviar a WhatsApp
-            url_send = f"{EVOLUTION_URL}/message/sendText/{EVOLUTION_INSTANCE}"
-            headers = {"apikey": EVOLUTION_APIKEY, "Content-Type": "application/json"}
-            payload = {"number": numero, "textMessage": {"text": respuesta_ia}}
-            res = requests.post(url_send, headers=headers, json=payload)
-            print(f"📤 Status Envío WA: {res.status_code}")
+            # 3. INTENTO DE ENVÍO
+            url_send = f"{EVO_URL}/message/sendText/{EVO_INST}"
+            headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
+            payload = {"number": numero, "textMessage": {"text": respuesta}}
+            
+            res = requests.post(url_send, headers=headers, json=payload, timeout=15)
+            print(f"📤 Respuesta Evolution: {res.status_code} - {res.text}")
 
-            # Guardar en Supabase
+            # 4. GUARDADO EN SUPABASE
             try:
-                # IMPORTANTE: Asegúrate que estas columnas existan en tu tabla 'messages'
                 supabase.table('messages').insert({
                     "user_id": numero, 
                     "user_input": texto_usuario,
-                    "bot_response": respuesta_ia
+                    "bot_response": respuesta
                 }).execute()
-                print("✅ Guardado en Supabase")
+                print("✅ Guardado en Supabase con éxito.")
             except Exception as e:
-                print(f"🔥 Error Supabase: {e}")
+                print(f"🔥 Error guardando en Supabase: {e}")
 
-        return jsonify({"status": "success"}), 200
+        return jsonify({"status": "processed"}), 200
+
     except Exception:
         traceback.print_exc()
-        return jsonify({"error": "check logs"}), 500
+        return jsonify({"status": "error"}), 500
 
 @app.route('/')
-def health(): return "Pizza Bot Online 🍕", 200
+def health(): return "Servidor Activo 🍕", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=PORT)
