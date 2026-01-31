@@ -6,7 +6,7 @@ URL_BOT = "https://barberia-bot-8sju.onrender.com" # Tu Bot Python
 API_KEY = "barberia123"
 INSTANCE = "BarberiaBot"
 
-webhook_url = f"{URL_BOT}/whatsapp"
+webhook_url = f"{URL_BOT}/whatsapp  "
 
 print(f"Configurando webhook hacia: {webhook_url}")
 

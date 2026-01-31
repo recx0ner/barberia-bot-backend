@@ -10,86 +10,106 @@ from supabase import create_client, Client
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN DE VARIABLES ---
+# --- 1. CONFIGURACIÓN ---
+# Rotación de llaves para máxima estabilidad
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
 VALID_GEMINI_KEYS = [key for key in GEMINI_KEYS if key]
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Datos de Evolution API (QR)
+# Conexión con Evolution API (QR)
 EVOLUTION_URL = os.environ.get("EVOLUTION_URL")
 EVOLUTION_APIKEY = os.environ.get("EVOLUTION_APIKEY")
 EVOLUTION_INSTANCE = os.environ.get("EVOLUTION_INSTANCE", "BarberiaBot")
 
+# Inicializar Base de Datos
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- LÓGICA DE IA ---
-def get_gemini_response(user_text, chat_id):
+# --- 2. PROMPT DE COMPORTAMIENTO ---
+SYSTEM_PROMPT = f"""
+Eres el asistente virtual de una barbería moderna. Tu tono es profesional y breve.
+Hoy es: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+--- REGLAS DE RESERVAS ---
+1. Si el usuario quiere RESERVAR y da Nombre, Fecha y Hora:
+   Responde SOLO este JSON: {{"action": "reservar", "nombre": "...", "fecha_hora": "YYYY-MM-DD HH:MM", "servicio": "..."}}
+
+2. Si el usuario quiere CANCELAR una cita:
+   Responde SOLO este JSON: {{"action": "cancelar", "fecha_hora": "YYYY-MM-DD HH:MM"}}
+
+Si falta información, pídela amablemente.
+"""
+
+# --- 3. LÓGICA DE CEREBRO (GEMINI 3 FLASH) ---
+
+def get_gemini_3_response(user_text, numero):
     try:
-        # Rotación de llaves
+        # 1. Rotación de llaves aleatoria
         genai.configure(api_key=random.choice(VALID_GEMINI_KEYS))
         
-        # Usamos 2.0 Flash Experimental (es la versión real actual)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # 2. Configuración del modelo Gemini 3 Flash
+        model = genai.GenerativeModel(
+            model_name='gemini-3-flash', # ¡Actualizado según tu captura!
+            system_instruction=SYSTEM_PROMPT
+        )
         
-        # Prompt simplificado para asegurar respuesta
-        prompt = f"Eres el asistente de una barbería. Responde de forma amable y breve. Cliente: {chat_id}"
+        # 3. Generar respuesta
+        response = model.generate_content(user_text)
+        txt = response.text.strip()
         
-        response = model.generate_content([prompt, user_text])
-        return response.text.strip()
+        # 4. Procesar si es una acción (JSON)
+        if 'action":' in txt:
+            try:
+                clean = txt.replace("```json", "").replace("```", "").strip()
+                data = json.loads(clean[clean.find('{'):clean.rfind('}')+1])
+                # Aquí llamarías a tus funciones de gestionar_reserva(data, numero)
+                return f"✅ Entendido. Procesando tu {data.get('action')} para el {data.get('fecha_hora')}."
+            except: pass
+            
+        return txt
     except Exception as e:
-        return f"Error IA: {str(e)}"
+        print(f"❌ Error en Gemini 3: {e}")
+        return "Lo siento, mi conexión con la red neuronal de Google falló. ¿Me repites?"
 
-# --- ENVÍO DE MENSAJE (VÍA EVOLUTION QR) ---
-def enviar_whatsapp_evolution(numero, texto):
+# --- 4. ENVÍO Y WEBHOOK ---
+
+def enviar_whatsapp(numero, texto):
     try:
         url = f"{EVOLUTION_URL}/message/sendText/{EVOLUTION_INSTANCE}"
         headers = {"apikey": EVOLUTION_APIKEY, "Content-Type": "application/json"}
-        payload = {
-            "number": numero,
-            "textMessage": {"text": texto}
-        }
+        payload = {"number": numero, "textMessage": {"text": texto}}
         requests.post(url, headers=headers, json=payload)
     except: pass
 
-# --- WEBHOOK COMPATIBLE CON EVOLUTION ---
 @app.route('/whatsapp', methods=['POST'])
-def whatsapp_webhook():
+def webhook():
     try:
         data = request.json
-        # Verificamos que sea un mensaje de Evolution
-        if data.get("type") == "MESSAGES_UPSERT":
-            msg = data['data']
-            if msg.get('key', {}).get('fromMe'): return jsonify({"status": "ignored"}), 200
+        if data.get("type") != "MESSAGES_UPSERT": return jsonify({"status": "ok"}), 200
+        
+        msg = data['data']
+        if msg.get('key', {}).get('fromMe'): return jsonify({"status": "ok"}), 200
+        
+        numero = msg['key']['remoteJid'].split('@')[0]
+        texto = (msg.get('message', {}).get('conversation') or 
+                 msg.get('message', {}).get('extendedTextMessage', {}).get('text') or "")
+        
+        if texto:
+            print(f"📩 Recibido: {texto}")
+            respuesta = get_gemini_3_response(texto, numero)
+            enviar_whatsapp(numero, respuesta)
             
-            sender = msg['key']['remoteJid'].split('@')[0]
+            # Guardar en Supabase
+            supabase.table('messages').insert({
+                "user_id": numero, "user_input": texto, "bot_response": respuesta, "platform": "whatsapp"
+            }).execute()
             
-            # Extraer texto del mensaje
-            body = (msg.get('message', {}).get('conversation') or 
-                    msg.get('message', {}).get('extendedTextMessage', {}).get('text') or "")
-            
-            if body:
-                print(f"📩 Mensaje recibido de {sender}: {body}")
-                
-                # 1. Obtener respuesta de la IA
-                resp_text = get_gemini_response(body, sender)
-                
-                # 2. Guardar en Supabase (TABLA MESSAGES)
-                supabase.table('messages').insert({
-                    "user_id": sender, 
-                    "user_input": body, 
-                    "bot_response": resp_text, 
-                    "platform": "whatsapp"
-                }).execute()
-                
-                # 3. Enviar respuesta por WhatsApp
-                enviar_whatsapp_evolution(sender, resp_text)
-                
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
+        return jsonify({"status": "success"}), 200
+    except:
         traceback.print_exc()
         return "Error", 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
