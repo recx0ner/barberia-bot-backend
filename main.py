@@ -6,30 +6,21 @@ from supabase import create_client
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN ---
+# --- 1. CONFIGURACIÓN ---
 PORT = int(os.environ.get("PORT", 10000))
-BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres un asistente de pizzería.")
+BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres un asistente divertido de una pizzería.")
+
+# Llaves de Gemini y Supabase
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
 VALID_KEYS = [k for k in GEMINI_KEYS if k]
-
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
+
+# Configuración de Evolution API
 EVO_URL = os.environ.get("EVOLUTION_URL")
 EVO_KEY = os.environ.get("EVOLUTION_APIKEY")
 EVO_INST = os.environ.get("EVOLUTION_INSTANCE")
 
-# --- FUNCIONES DE APOYO ---
-
-def buscar_llave(data, llave):
-    if isinstance(data, dict):
-        if llave in data: return data[llave]
-        for v in data.values():
-            res = buscar_llave(v, llave)
-            if res: return res
-    elif isinstance(data, list):
-        for item in data:
-            res = buscar_llave(item, llave)
-            if res: return res
-    return None
+# --- 2. LÓGICA DE IA ---
 
 def get_gemini_response(user_text):
     try:
@@ -45,17 +36,44 @@ def get_gemini_response(user_text):
         print(f"❌ Error Gemini: {e}")
         return "Lo siento, tuve un pequeño problema técnico. ¿Me repites?"
 
-# --- WEBHOOK ---
+# --- 3. FUNCIÓN DE ENVÍO (CORREGIDA PARA EVITAR EL 502) ---
+
+def enviar_whatsapp(numero, texto):
+    try:
+        # AUTO-LIMPIEZA: Quitamos espacios y barras al final de la URL
+        base_url = EVO_URL.strip().rstrip('/')
+        url_send = f"{base_url}/message/sendText/{EVO_INST}"
+        
+        headers = {
+            "apikey": EVO_KEY, 
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "number": numero, 
+            "textMessage": {"text": texto}
+        }
+        
+        print(f"DEBUG: Intentando enviar a -> {url_send}")
+        res = requests.post(url_send, headers=headers, json=payload, timeout=15)
+        
+        print(f"📤 Evolution Status: {res.status_code}")
+        if res.status_code not in [200, 201]:
+            print(f"⚠️ Error detallado de Evolution: {res.text}")
+            
+        return res.status_code
+    except Exception as e:
+        print(f"🔥 Error crítico en el envío: {e}")
+        return 500
+
+# --- 4. WEBHOOK UNIVERSAL ---
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
-    # Soporte para Verificación de Webhook de Meta (por si acaso)
+    # Soporte para Verificación de Meta (Webhooks)
     if request.method == 'GET':
-        mode = request.args.get('hub.mode')
-        token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
-        if mode and token:
-            return challenge, 200
+        if challenge: return challenge, 200
 
     payload = request.json
     print("--- NUEVO PAYLOAD DETECTADO ---")
@@ -64,9 +82,9 @@ def webhook():
     texto_usuario = None
 
     try:
-        # 1. CASO A: Formato Meta Cloud API (Tus logs actuales)
+        # Detectar formato Meta Cloud API (Tus logs actuales)
         if 'object' in payload and 'entry' in payload:
-            print("Detectado formato Meta Cloud API")
+            print("📦 Formato detectado: Meta Cloud API")
             try:
                 entry = payload['entry'][0]
                 changes = entry.get('changes', [{}])[0]
@@ -74,36 +92,28 @@ def webhook():
                 if 'messages' in value:
                     msg = value['messages'][0]
                     numero = msg.get('from')
-                    texto_usuario = msg.get('text', {}).get('body') or msg.get('button', {}).get('text')
+                    texto_usuario = msg.get('text', {}).get('body')
             except: pass
 
-        # 2. CASO B: Formato Evolution API o Búsqueda Genérica
+        # Detectar formato Evolution API (Backup)
         if not numero:
-            remote_jid = buscar_llave(payload, 'remoteJid')
-            if remote_jid:
-                numero = str(remote_jid).split('@')[0]
-                texto_usuario = (buscar_llave(payload, 'conversation') or 
-                                 buscar_llave(payload, 'text') or 
-                                 buscar_llave(payload, 'displayText'))
+            print("📦 Formato detectado: Evolution API / Genérico")
+            data_content = payload.get('data', payload)
+            numero = data_content.get('key', {}).get('remoteJid', '').split('@')[0]
+            msg_obj = data_content.get('message', {})
+            texto_usuario = msg_obj.get('conversation') or msg_obj.get('extendedTextMessage', {}).get('text')
 
-        # 3. PROCESAMIENTO SI HAY DATOS
+        # Procesar el mensaje
         if numero and texto_usuario:
-            # Evitar auto-respuestas
-            if buscar_llave(payload, 'fromMe') is True:
-                return jsonify({"status": "ignored_self"}), 200
-
             print(f"📩 Mensaje de {numero}: {texto_usuario}")
-            respuesta_ia = get_gemini_response(texto_usuario)
-
-            # Enviar vía Evolution API
-            url_send = f"{EVO_URL}/message/sendText/{EVO_INST}"
-            headers = {"apikey": EVO_KEY, "Content-Type": "application/json"}
-            send_data = {"number": numero, "textMessage": {"text": respuesta_ia}}
             
-            res = requests.post(url_send, headers=headers, json=send_data, timeout=10)
-            print(f"📤 Evolution Status: {res.status_code}")
-
-            # Guardar en Supabase
+            # 1. Obtener respuesta de IA
+            respuesta_ia = get_gemini_response(texto_usuario)
+            
+            # 2. Enviar a WhatsApp
+            enviar_whatsapp(numero, respuesta_ia)
+            
+            # 3. Guardar en Supabase (Ya funcionando)
             try:
                 supabase.table('messages').insert({
                     "user_id": numero, 
@@ -114,7 +124,7 @@ def webhook():
             except Exception as e:
                 print(f"🔥 Error Supabase: {e}")
         else:
-            print("⚠️ El paquete no contenía un mensaje de texto procesable.")
+            print("⚠️ No se pudo extraer número o texto del paquete.")
 
         return jsonify({"status": "success"}), 200
 
@@ -123,7 +133,7 @@ def webhook():
         return jsonify({"status": "error"}), 500
 
 @app.route('/')
-def health(): return "Bot Multi-Formato Activo 🚀", 200
+def health(): return "Bot Multi-Canal Activo 🚀", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=PORT)
