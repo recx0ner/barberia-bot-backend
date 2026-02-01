@@ -15,22 +15,24 @@ VALID_KEYS = [k for k in GEMINI_KEYS if k] # Rotación de las 3 llaves
 
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
-ADMIN_PHONE = os.environ.get("ADMIN_PHONE") # Número para notificaciones
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE") # Tu número para confirmar pagos
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
 # --- FUNCIONES DE COMUNICACIÓN ---
 def enviar_meta(to, text):
+    # Función para enviar mensajes a través del número oficial del bot
     url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     return requests.post(url, headers=headers, json=payload)
 
-# --- IA CON FAILOVER (PROTECCIÓN CONTRA ERROR 429) ---
+# --- IA CON FAILOVER (ROTACIÓN ANTIBLOQUEO) ---
 def generar_respuesta_ia(instruccion, texto_usuario):
+    # Implementa el uso de las 3 llaves para evitar el error 429
     llaves_shuffled = VALID_KEYS[:]
-    random.shuffle(llaves_shuffled) # Distribución de carga aleatoria
+    random.shuffle(llaves_shuffled) 
 
     for key in llaves_shuffled:
         try:
@@ -42,36 +44,45 @@ def generar_respuesta_ia(instruccion, texto_usuario):
             )
             return response.text.strip()
         except errors.ClientError as e:
-            if "429" in str(e): # Si una llave falla por cuota, salta a la siguiente
-                print(f"⚠️ Cuota agotada en una llave, reintentando...")
+            if "429" in str(e): # Si la cuota está agotada, salta a la siguiente
+                print(f"⚠️ Llave agotada, reintentando con otra...")
                 continue
             raise e
-    return "Estamos bajo mucha demanda pizzería, ¡vuelve a intentarlo en un momento!"
+    return "Nuestros sistemas están algo saturados, por favor intenta en unos minutos."
 
-# --- GESTIÓN DE BASE DE DATOS (CLIENTES Y CITAS) ---
-def ejecutar_logica_negocio(id_num, accion, texto=""):
+# --- LÓGICA DE NEGOCIO (CITAS Y PAGOS) ---
+def ejecutar_logica_negocio(id_num, accion, texto="", nombre_actual="Cliente"):
     try:
-        # 1. Aseguramos registro en tabla 'cliente' para evitar Error 23503
-        supabase.table('cliente').upsert({"id": id_num, "telefono": str(id_num)}).execute()
+        # Aseguramos que el cliente exista para evitar Error 23503
+        supabase.table('cliente').upsert({"id": id_num, "nombre": nombre_actual, "telefono": str(id_num)}).execute()
 
         if accion == "AGENDAR":
-            # Usamos todas tus columnas: user_id, servicio, fecha_hora y estado
+            # Agendado en las columnas: user_id, nombre, servicio, fecha_hora, estado
             supabase.table('citas').insert({
                 "user_id": id_num, 
+                "nombre": nombre_actual,
                 "servicio": texto, 
                 "fecha_hora": datetime.now(venezuela_tz).isoformat(),
                 "estado": "pendiente"
             }).execute()
-            return "✅ ¡Pedido agendado! Manos a la masa."
+            return "✅ ¡Pizza agendada! Ya estamos manos a la masa."
         
-        elif accion == "CANCELAR":
-            supabase.table('citas').update({"estado": "cancelado"})\
-                .eq("user_id", id_num).eq("estado", "pendiente").execute()
-            return "🗑️ Pedido cancelado correctamente."
+        elif accion == "PAGO":
+            # Extrae la referencia de pago del texto
+            ref = ''.join(filter(str.isdigit, texto))
+            if len(ref) < 6: return "⚠️ Referencia inválida, por favor envíala completa."
             
+            # Registra el pago en estado no verificado
+            supabase.table('pagos').insert({"user_id": id_num, "referencia": ref, "verificado": False}).execute()
+            
+            # Notifica al administrador para su validación
+            if ADMIN_PHONE:
+                enviar_meta(ADMIN_PHONE, f"🔔 *PAGO RECIBIDO*\nCliente: {nombre_actual}\nRef: {ref}\n\nResponde: *CONFIRMAR {ref}*")
+            return "⏳ Referencia recibida. Te avisaré cuando el administrador la verifique."
+
     except Exception as e:
-        print(f"🔥 Error DB: {str(e)}") # Oculto al cliente por profesionalismo
-        return "✅ ¡Entendido! Ya procesé tu solicitud."
+        print(f"🔥 Error en DB: {str(e)}") # Ocultamos errores técnicos al cliente
+        return "✅ ¡Entendido! Ya tomé nota de tu solicitud."
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
@@ -84,11 +95,20 @@ def webhook():
         if 'messages' in entry:
             msg = entry['messages'][0]
             numero_str = msg['from']
-            id_num = int(numero_str) # ID numérico int8
+            id_num = int(numero_str) # Conversión a int8 para compatibilidad
             texto = msg.get('text', {}).get('body', "").strip()
-            ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S')
+            ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S') #
 
-            # 1. Recuperar Identidad y Memoria
+            # 1. LÓGICA DE ADMINISTRADOR (VERIFICACIÓN DE PAGOS)
+            if ADMIN_PHONE and numero_str == ADMIN_PHONE and texto.upper().startswith("CONFIRMAR"):
+                ref_confirmar = texto.split()[-1]
+                res_pago = supabase.table('pagos').update({"verificado": True}).eq("referencia", ref_confirmar).execute()
+                if res_pago.data:
+                    cliente_id = res_pago.data[0]['user_id']
+                    enviar_meta(str(cliente_id), "✅ *¡Pago verificado!* Tu pedido ya está en el horno. 🍕🔥")
+                    return jsonify({"status": "pago_confirmado"}), 200
+
+            # 2. IDENTIDAD Y MEMORIA
             res_cli = supabase.table('cliente').select('nombre').eq('id', id_num).execute()
             nombre_cli = res_cli.data[0]['nombre'] if res_cli.data and res_cli.data[0]['nombre'] else "Desconocido"
             
@@ -96,28 +116,30 @@ def webhook():
                 .eq('user_id', numero_str).order('created_at', desc=True).limit(6).execute()
             historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(res_mem.data)])
 
-            # 2. IA con Instrucciones de Acción
+            # 3. PROCESAMIENTO DE IA
             instruccion = f"""{BUSINESS_CONTEXT}\nHora VZLA: {ahora_ve}\nCliente: {nombre_cli}\nHistorial:\n{historial}
             REGLAS:
-            - Si el cliente confirma pedido (ej: "así es"), usa: [ACCION:AGENDAR]
-            - Si no sabes su nombre, pregunta y usa: [ACCION:NOMBRE:Nombre]
-            - Si cancela, usa: [ACCION:CANCELAR]
+            - Si no sabes el nombre del cliente, pregúntalo antes de agendar.
+            - Si el cliente te dice su nombre, usa: [ACCION:NOMBRE:Nombre]
+            - Si confirma pedido, usa: [ACCION:AGENDAR]
+            - Si envía comprobante/referencia de pago, usa: [ACCION:PAGO]
             """
             
             respuesta_ia = generar_respuesta_ia(instruccion, texto)
 
-            # 3. Procesar Tags de Acción
+            # 4. PROCESAR ACCIONES DE NEGOCIO
             if "[ACCION:NOMBRE:" in respuesta_ia:
                 nuevo_nom = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
                 supabase.table('cliente').upsert({"id": id_num, "nombre": nuevo_nom, "telefono": numero_str}).execute()
+                nombre_cli = nuevo_nom
                 respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
-            for tag in ["AGENDAR", "CANCELAR"]:
+            for tag in ["AGENDAR", "PAGO"]:
                 if f"[ACCION:{tag}]" in respuesta_ia:
-                    feedback = ejecutar_logica_negocio(id_num, tag, texto)
+                    feedback = ejecutar_logica_negocio(id_num, tag, texto, nombre_cli)
                     respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
 
-            # 4. Responder y Loguear
+            # 5. RESPUESTA FINAL Y REGISTRO EN MEMORIA
             enviar_meta(numero_str, respuesta_ia)
             supabase.table('messages').insert({"user_id": numero_str, "user_input": texto, "bot_response": respuesta_ia}).execute()
 
