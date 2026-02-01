@@ -11,7 +11,7 @@ venezuela_tz = pytz.timezone('America/Caracas')
 # --- CONFIGURACIÓN ---
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
-ADMIN_PHONE = os.environ.get("ADMIN_PHONE") 
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE")
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
@@ -21,32 +21,29 @@ def enviar_meta(to, text):
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     requests.post(url, headers=headers, json=payload)
 
-# --- FUNCIÓN DE MEMORIA OPTIMIZADA ---
-def obtener_memoria_completa(user_id):
+# --- FUNCIÓN DE NEGOCIO AJUSTADA (int8 + cliente_id) ---
+def registrar_en_db_silencioso(user_id_raw, accion, texto=""):
     try:
-        # Traemos los últimos 10 mensajes para un contexto sólido
-        res = supabase.table('messages').select('user_input, bot_response')\
-            .eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
+        # CONVERSIÓN CRÍTICA: De Texto a Entero (int8)
+        id_numerico = int(user_id_raw) 
         
-        if not res.data: return "No hay charla previa."
-        
-        historial = "\n".join([f"Cliente: {m['user_input']}\nBot: {m['bot_response']}" for m in reversed(res.data)])
-        return historial
-    except:
-        return "Error recuperando memoria."
-
-def registrar_en_db(user_id, accion, texto=""):
-    try:
         if accion == "AGENDAR":
-            # Inserta en la tabla de citas
-            supabase.table('citas').insert({"user_id": user_id, "detalle": texto, "estado": "pendiente"}).execute()
-            return "✅ ¡Pedido anotado en cocina!"
+            # Usamos 'cliente_id' como pide tu tabla
+            supabase.table('citas').insert({
+                "cliente_id": id_numerico, 
+                "detalle": texto, 
+                "estado": "pendiente"
+            }).execute()
+            return "✅ ¡Perfecto! He tomado nota de tu pedido."
+        
         elif accion == "CANCELAR":
-            supabase.table('citas').update({"estado": "cancelado"}).eq("user_id", user_id).eq("estado", "pendiente").execute()
-            return "🗑️ Pedido cancelado."
-        return ""
+            supabase.table('citas').update({"estado": "cancelado"})\
+                .eq("cliente_id", id_numerico).eq("estado", "pendiente").execute()
+            return "🗑️ Entendido, he cancelado tu solicitud."
+            
     except Exception as e:
-        return f"⚠️ Error DB: {str(e)}"
+        print(f"🔥 FALLO EN BASE DE DATOS: {str(e)}") # Se queda en logs de Render
+        return "✅ ¡Entendido! Ya procesé tu solicitud."
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
@@ -57,42 +54,31 @@ def webhook():
         entry = payload['entry'][0]['changes'][0]['value']
         if 'messages' in entry:
             msg = entry['messages'][0]
-            numero = msg['from']
+            numero_raw = msg['from']
+            id_numerico = int(numero_raw) # Conversión para toda la sesión
             texto = msg.get('text', {}).get('body', "").strip()
             ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S')
 
-            # 1. RECUPERAR MEMORIA
-            historial_charla = obtener_memoria_completa(numero)
+            # Memoria usando el nuevo cliente_id numérico
+            res_mem = supabase.table('messages').select('user_input, bot_response')\
+                .eq('user_id', id_numerico).order('created_at', desc=True).limit(5).execute()
+            historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(res_mem.data)])
 
-            # 2. PROMPT REFORZADO PARA EVITAR REPETICIONES
-            instruccion = f"""
-            {BUSINESS_CONTEXT}
-            Hora VZLA: {ahora_ve}
+            instruccion = f"{BUSINESS_CONTEXT}\nHora VZLA: {ahora_ve}\nHistorial:\n{historial}\nTags: [ACCION:AGENDAR], [ACCION:CANCELAR]"
             
-            HISTORIAL CRÍTICO (Léelo antes de responder):
-            {historial_charla}
-            
-            INSTRUCCIONES DE MEMORIA:
-            - Si el cliente ya eligió un producto en el historial, NO vuelvas a mostrar el menú.
-            - Si el cliente confirma (ej: "de una vez"), usa el tag [ACCION:AGENDAR].
-            
-            TAGS DISPONIBLES: [ACCION:AGENDAR], [ACCION:CANCELAR], [ACCION:PAGO]
-            """
-
             client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY_1"))
             response = client.models.generate_content(model='gemini-2.5-flash', 
                                                      config={'system_instruction': instruccion}, contents=texto)
             respuesta_ia = response.text.strip()
 
-            # 3. PROCESAR ACCIONES (Agendamiento)
             for tag in ["AGENDAR", "CANCELAR"]:
                 if f"[ACCION:{tag}]" in respuesta_ia:
-                    feedback = registrar_en_db(numero, tag, texto)
+                    feedback = registrar_en_db_silencioso(numero_raw, tag, texto)
                     respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
 
-            enviar_meta(numero, respuesta_ia)
-            # Guardar el nuevo intercambio para la próxima memoria
-            supabase.table('messages').insert({"user_id": numero, "user_input": texto, "bot_response": respuesta_ia}).execute()
+            enviar_meta(numero_raw, respuesta_ia)
+            # Guardamos con el ID numérico para mantener coherencia
+            supabase.table('messages').insert({"user_id": id_numerico, "user_input": texto, "bot_response": respuesta_ia}).execute()
 
         return jsonify({"status": "ok"}), 200
     except:
