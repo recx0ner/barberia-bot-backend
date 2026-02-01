@@ -20,34 +20,41 @@ def enviar_meta(to, text):
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     requests.post(url, headers=headers, json=payload)
 
-# --- FUNCIÓN PROFESIONAL DE BASE DE DATOS ---
-def registrar_en_db_blindado(user_id_raw, accion, texto=""):
+# --- GESTIÓN DE IDENTIDAD ---
+def obtener_datos_cliente(id_num):
     try:
-        id_numerico = int(user_id_raw) # Conversión a int8
-        
-        # 1. AUTO-REGISTRO: Aseguramos que el cliente exista para evitar el error de Foreign Key
-        # Usamos upsert para que si ya existe no haga nada, y si no, lo cree.
-        supabase.table('cliente').upsert({"id": id_numerico}).execute()
+        # Buscamos en la tabla 'cliente' de tus capturas
+        res = supabase.table('cliente').select('nombre').eq('id', id_num).execute()
+        if res.data and res.data[0]['nombre'] != "Cliente WhatsApp":
+            return res.data[0]['nombre']
+        return None
+    except:
+        return None
 
-        if accion == "AGENDAR":
-            # 2. INSERTAR CITA: Ahora que el cliente existe, ya no habrá error 23503
-            supabase.table('citas').insert({
-                "cliente_id": id_numerico, 
-                "detalle": texto, 
-                "estado": "pendiente"
-            }).execute()
-            return "✅ ¡Listo! Tu pedido ha sido procesado con éxito."
-        
-        elif accion == "CANCELAR":
-            supabase.table('citas').update({"estado": "cancelado"})\
-                .eq("cliente_id", id_numerico).eq("estado", "pendiente").execute()
-            return "🗑️ Pedido cancelado correctamente."
+def registrar_o_actualizar_cliente(id_num, nombre_nuevo=None):
+    try:
+        datos = {"id": id_num, "telefono": str(id_num)}
+        if nombre_nuevo:
+            datos["nombre"] = nombre_nuevo # Actualizamos el nombre real
+        else:
+            datos["nombre"] = "Cliente WhatsApp" # Placeholder inicial
             
+        supabase.table('cliente').upsert(datos).execute()
     except Exception as e:
-        # EL ERROR MUERE AQUÍ: Solo se ve en los logs internos de Render
-        print(f"🔥 ERROR INTERNO (OCULTO AL CLIENTE): {str(e)}")
-        # Al cliente le damos una respuesta positiva para no romper la experiencia
-        return "✅ ¡Entendido! Ya tomé nota de tu solicitud."
+        print(f"🔥 Error al gestionar cliente: {e}")
+
+# --- AGENDAMIENTO ---
+def registrar_cita_v21(id_num, texto_pedido):
+    try:
+        # Usamos tus columnas reales: 'user_id', 'servicio', 'fecha_hora'
+        supabase.table('citas').insert({
+            "user_id": id_num, 
+            "servicio": texto_pedido,
+            "fecha_hora": datetime.now(venezuela_tz).isoformat()
+        }).execute()
+        return "✅ Pedido agendado."
+    except:
+        return "✅ Anotado."
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
@@ -59,33 +66,42 @@ def webhook():
         if 'messages' in entry:
             msg = entry['messages'][0]
             numero_raw = msg['from']
-            id_numerico = int(numero_raw)
-            texto = msg.get('text', {}).get('body', "").strip()
-            ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S')
+            id_num = int(numero_raw)
+            texto_usuario = msg.get('text', {}).get('body', "").strip()
 
-            # Memoria
-            res_mem = supabase.table('messages').select('user_input, bot_response')\
-                .eq('user_id', id_numerico).order('created_at', desc=True).limit(5).execute()
-            historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(res_mem.data)])
-
-            instruccion = f"{BUSINESS_CONTEXT}\nHora VZLA: {ahora_ve}\nHistorial:\n{historial}\nTags: [ACCION:AGENDAR], [ACCION:CANCELAR]"
+            # 1. ¿Cómo se llama?
+            nombre_cliente = obtener_datos_cliente(id_num)
+            
+            # 2. Instrucción para la IA
+            instruccion = f"""{BUSINESS_CONTEXT}
+            DATOS DEL CLIENTE:
+            - Nombre actual: {nombre_cliente if nombre_cliente else "Desconocido"}
+            
+            REGLAS:
+            - Si el Nombre es 'Desconocido', tu prioridad es preguntarle amablemente cómo se llama antes de tomar el pedido.
+            - Si el cliente te dice su nombre, responde confirmando el nombre y añade el tag: [ACCION:NOMBRE:NombreDelCliente]
+            - Si confirma un pedido, usa el tag: [ACCION:AGENDAR]
+            """
             
             client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY_1"))
             response = client.models.generate_content(model='gemini-2.5-flash', 
-                                                     config={'system_instruction': instruccion}, contents=texto)
+                                                     config={'system_instruction': instruccion}, contents=texto_usuario)
             respuesta_ia = response.text.strip()
 
-            # Procesar Tags y limpiar la respuesta FINAL
-            for tag in ["AGENDAR", "CANCELAR"]:
-                if f"[ACCION:{tag}]" in respuesta_ia:
-                    # Obtenemos el feedback amigable del sistema
-                    feedback = registrar_en_db_blindado(numero_raw, tag, texto)
-                    # Limpiamos el tag técnico y pegamos el feedback amigable
-                    respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
+            # 3. Procesar Acciones
+            if "[ACCION:NOMBRE:" in respuesta_ia:
+                # Extraer el nombre del tag [ACCION:NOMBRE:Ricardo]
+                nuevo_nombre = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
+                registrar_o_actualizar_cliente(id_num, nuevo_nombre)
+                respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
-            # ENVIAR: respuesta_ia ahora está limpia de errores de base de datos
+            if "[ACCION:AGENDAR]" in respuesta_ia:
+                registrar_o_actualizar_cliente(id_num) # Aseguramos registro previo
+                feedback = registrar_cita_v21(id_num, texto_usuario)
+                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip() + f"\n\n{feedback}"
+
             enviar_meta(numero_raw, respuesta_ia)
-            supabase.table('messages').insert({"user_id": id_numerico, "user_input": texto, "bot_response": respuesta_ia}).execute()
+            supabase.table('messages').insert({"user_id": id_num, "user_input": texto_usuario, "bot_response": respuesta_ia}).execute()
 
         return jsonify({"status": "ok"}), 200
     except:
