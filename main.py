@@ -1,169 +1,146 @@
-import os, random, requests, traceback
+import os, random, requests, traceback, base64
 from datetime import datetime, timedelta
 import pytz 
 from flask import Flask, request, jsonify
 from google import genai 
-from google.genai import errors 
+from google.genai import errors, types
 from supabase import create_client
 
 app = Flask(__name__)
 venezuela_tz = pytz.timezone('America/Caracas')
 
-# --- CONFIGURACIÓN DE LLAVES Y ENTORNO ---
+# --- CONFIGURACIÓN ---
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
-VALID_KEYS = [k for k in GEMINI_KEYS if k] # Rotación de 3 llaves
-
+VALID_KEYS = [k for k in GEMINI_KEYS if k]
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
-ADMIN_PHONE = os.environ.get("ADMIN_PHONE") # Número para confirmaciones
-BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
-
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE") #
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
+BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
 # --- FUNCIONES DE COMUNICACIÓN ---
 def enviar_meta(to, text):
-    # Envío oficial por el número del bot de Meta
     url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     return requests.post(url, headers=headers, json=payload)
 
-# --- IA CON REINTENTOS (FAILOVER) ---
-def generar_respuesta_ia(instruccion, texto_usuario):
-    # Protege contra el error 429 de cuota agotada
-    llaves_shuffled = VALID_KEYS[:]
-    random.shuffle(llaves_shuffled) 
+def descargar_imagen_meta(media_id):
+    url = f"https://graph.facebook.com/v18.0/{media_id}"
+    headers = {"Authorization": f"Bearer {META_TOKEN}"}
+    res = requests.get(url, headers=headers).json()
+    image_url = res.get('url')
+    if image_url:
+        img_res = requests.get(image_url, headers=headers)
+        return img_res.content
+    return None
 
-    for key in llaves_shuffled:
+# --- IA CON REINTENTOS Y SOPORTE MULTIMODAL ---
+def procesar_con_ia(instruccion, contenido_usuario, es_imagen=False):
+    llaves = VALID_KEYS[:]
+    random.shuffle(llaves)
+    for key in llaves:
         try:
             client = genai.Client(api_key=key)
+            if es_imagen:
+                # Si el usuario mandó foto, la IA la analiza para buscar la referencia
+                contenido = [types.Part.from_bytes(data=contenido_usuario, mime_type="image/jpeg"), "Analiza este comprobante y extrae la referencia de pago."]
+            else:
+                contenido = contenido_usuario
+
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 config={'system_instruction': instruccion},
-                contents=texto_usuario
+                contents=contenido
             )
             return response.text.strip()
         except errors.ClientError as e:
-            if "429" in str(e):
-                print(f"⚠️ Llave agotada, probando otra llave de las 3 disponibles...")
-                continue
+            if "429" in str(e): continue
             raise e
-    return "Lo sentimos, estamos horneando demasiadas respuestas. Intenta de nuevo en unos minutos."
+    return "Estamos bajo mucha demanda, ¡intenta de nuevo en un momento!"
 
-# --- LÓGICA DE NEGOCIO (CITAS, PAGOS Y CANCELACIÓN LÍMITE) ---
-def ejecutar_logica_negocio(id_num, accion, texto="", nombre_actual="Cliente"):
+# --- LÓGICA DE NEGOCIO ---
+def ejecutar_accion(id_num, accion, texto="", nombre_actual="Cliente"):
     try:
-        # Asegurar que el cliente existe en la tabla 'cliente'
+        # Aseguramos existencia del cliente
         supabase.table('cliente').upsert({"id": id_num, "nombre": nombre_actual, "telefono": str(id_num)}).execute()
 
         if accion == "AGENDAR":
-            # Agendado con columnas: user_id, nombre, servicio, fecha_hora, estado
+            # Guardamos con el nombre real para que la celda no quede vacía
             supabase.table('citas').insert({
-                "user_id": id_num, 
-                "nombre": nombre_actual,
-                "servicio": texto, 
-                "fecha_hora": datetime.now(venezuela_tz).isoformat(),
-                "estado": "pendiente"
+                "user_id": id_num, "nombre": nombre_actual, "servicio": texto,
+                "fecha_hora": datetime.now(venezuela_tz).isoformat(), "estado": "pendiente"
             }).execute()
-            return "✅ ¡Pedido agendado! Estamos manos a la masa. Recuerda que tienes 20 min para cancelar si lo necesitas."
-        
+            return "✅ ¡Pedido agendado! Tienes 20 min para cancelar si lo necesitas."
+
         elif accion == "CANCELAR":
-            # 1. Buscar el último pedido pendiente del cliente
-            res = supabase.table('citas').select('id, fecha_hora')\
-                .eq('user_id', id_num).eq('estado', 'pendiente')\
-                .order('fecha_hora', desc=True).limit(1).execute()
-            
-            if not res.data:
-                return "❌ No tienes ningún pedido pendiente que se pueda cancelar en este momento."
-            
-            # 2. Verificar límite de 20 minutos [NUEVA FUNCIÓN]
-            cita = res.data[0]
-            fecha_cita = datetime.fromisoformat(cita['fecha_hora'])
-            ahora = datetime.now(venezuela_tz)
-            
-            # Cálculo de la diferencia en minutos
-            diferencia = (ahora - fecha_cita).total_seconds() / 60
-            
-            if diferencia <= 20:
-                supabase.table('citas').update({"estado": "cancelado"}).eq("id", cita['id']).execute()
-                return f"🗑️ Tu pedido ha sido cancelado con éxito (han pasado {int(diferencia)} min)."
-            else:
-                return f"⛔ Lo sentimos, han pasado {int(diferencia)} minutos. Tu pizza ya está en el horno y no se puede cancelar. Debes proceder con el pago."
+            res = supabase.table('citas').select('id, fecha_hora').eq('user_id', id_num).eq('estado', 'pendiente').order('fecha_hora', desc=True).limit(1).execute()
+            if res.data:
+                fecha_cita = datetime.fromisoformat(res.data[0]['fecha_hora'])
+                if (datetime.now(venezuela_tz) - fecha_cita).total_seconds() / 60 <= 20:
+                    supabase.table('citas').update({"estado": "cancelado"}).eq("id", res.data[0]['id']).execute()
+                    return "🗑️ Tu pedido ha sido cancelado con éxito."
+                return "⛔ Ya pasaron más de 20 min. Tu pizza ya está en preparación y no se puede cancelar."
+            return "❌ No encontré pedidos pendientes para cancelar."
 
         elif accion == "PAGO":
             ref = ''.join(filter(str.isdigit, texto))
-            if len(ref) < 6: return "⚠️ Referencia inválida, por favor envíala completa."
-            
-            # Registrar pago para verificación del admin
-            supabase.table('pagos').insert({"user_id": id_num, "referencia": ref, "verificado": False}).execute()
-            
-            if ADMIN_PHONE:
-                enviar_meta(ADMIN_PHONE, f"🔔 *PAGO RECIBIDO*\nCliente: {nombre_actual}\nRef: {ref}\n\nResponde: *CONFIRMAR {ref}*")
-            return "⏳ Referencia recibida. Te avisaré cuando el administrador la verifique."
+            if len(ref) >= 4:
+                supabase.table('pagos').insert({"user_id": id_num, "referencia": ref, "verificado": False}).execute()
+                if ADMIN_PHONE:
+                    enviar_meta(ADMIN_PHONE, f"🔔 *NUEVO PAGO*\nCliente: {nombre_actual}\nRef: {ref}\n\nResponde: *CONFIRMAR {ref}*")
+                return "⏳ Referencia recibida. El administrador la verificará pronto."
+            return "⚠️ No pude detectar una referencia válida en el comprobante."
 
     except Exception as e:
-        print(f"🔥 Error en DB: {str(e)}")
+        print(f"🔥 Error DB: {e}")
         return "✅ ¡Entendido! Ya procesé tu solicitud."
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
-    if request.method == 'GET':
-        return request.args.get("hub.challenge"), 200
-
+    if request.method == 'GET': return request.args.get("hub.challenge"), 200
+    
     payload = request.json
     try:
         entry = payload['entry'][0]['changes'][0]['value']
         if 'messages' in entry:
             msg = entry['messages'][0]
-            numero_str = msg['from']
-            id_num = int(numero_str) # int8
-            texto = msg.get('text', {}).get('body', "").strip()
-            ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S') #
-
-            # 1. LÓGICA DE ADMINISTRADOR
-            if ADMIN_PHONE and numero_str == ADMIN_PHONE and texto.upper().startswith("CONFIRMAR"):
-                ref_v = texto.split()[-1]
+            numero = msg['from']
+            id_num = int(numero)
+            
+            # 1. Lógica de Admin
+            texto_admin = msg.get('text', {}).get('body', "").strip()
+            if ADMIN_PHONE and numero == ADMIN_PHONE and texto_admin.upper().startswith("CONFIRMAR"):
+                ref_v = texto_admin.split()[-1]
                 res_p = supabase.table('pagos').update({"verificado": True}).eq("referencia", ref_v).execute()
                 if res_p.data:
-                    c_id = res_p.data[0]['user_id']
-                    enviar_meta(str(c_id), "✅ *¡Pago verificado!* Tu pedido ya está en el horno. 🍕🔥")
+                    enviar_meta(str(res_p.data[0]['user_id']), "✅ *¡Pago verificado!* Tu pizza ya está lista. 🍕")
                     return jsonify({"status": "ok"}), 200
 
-            # 2. IDENTIDAD Y MEMORIA
+            # 2. Identidad y Memoria
             res_cli = supabase.table('cliente').select('nombre').eq('id', id_num).execute()
-            nombre_cli = res_cli.data[0]['nombre'] if res_cli.data and res_cli.data[0]['nombre'] else "Desconocido"
+            nombre_actual = res_cli.data[0]['nombre'] if res_cli.data and res_cli.data[0]['nombre'] else "Desconocido"
             
-            res_mem = supabase.table('messages').select('user_input, bot_response')\
-                .eq('user_id', numero_str).order('created_at', desc=True).limit(6).execute()
-            historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(res_mem.data)])
+            # 3. Manejo de contenido (Texto o Imagen)
+            es_imagen = 'image' in msg
+            contenido = descargar_imagen_meta(msg['image']['id']) if es_imagen else texto_admin
 
-            # 3. PROCESAMIENTO IA
-            instruccion = f"""{BUSINESS_CONTEXT}\nHora VZLA: {ahora_ve}\nCliente: {nombre_cli}\nHistorial:\n{historial}
-            REGLAS:
-            - Prioridad: Si no sabes el nombre, pregúntalo.
-            - Si te da el nombre, usa: [ACCION:NOMBRE:Nombre]
-            - Si confirma pedido, usa: [ACCION:AGENDAR]
-            - Si quiere cancelar, usa: [ACCION:CANCELAR] (Infórmale que tiene solo 20 min).
-            - Si envía pago, usa: [ACCION:PAGO]
-            """
-            
-            respuesta_ia = generar_respuesta_ia(instruccion, texto)
+            instruccion = f"{BUSINESS_CONTEXT}\nCliente: {nombre_actual}\nTags: [ACCION:AGENDAR], [ACCION:NOMBRE:Nombre], [ACCION:PAGO], [ACCION:CANCELAR]"
+            respuesta_ia = procesar_con_ia(instruccion, contenido, es_imagen)
 
-            # 4. PROCESAR ACCIONES
+            # 4. Tags
             if "[ACCION:NOMBRE:" in respuesta_ia:
-                nuevo_nom = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
-                supabase.table('cliente').upsert({"id": id_num, "nombre": nuevo_nom, "telefono": numero_str}).execute()
-                nombre_cli = nuevo_nom
+                nombre_actual = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
+                supabase.table('cliente').upsert({"id": id_num, "nombre": nombre_actual, "telefono": numero}).execute()
                 respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
-            for tag in ["AGENDAR", "CANCELAR", "PAGO"]:
+            for tag in ["AGENDAR", "PAGO", "CANCELAR"]:
                 if f"[ACCION:{tag}]" in respuesta_ia:
-                    feedback = ejecutar_logica_negocio(id_num, tag, texto, nombre_cli)
+                    feedback = ejecutar_accion(id_num, tag, respuesta_ia if tag == "PAGO" else texto_admin, nombre_actual)
                     respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
 
-            # 5. RESPUESTA Y LOG
-            enviar_meta(numero_str, respuesta_ia)
-            supabase.table('messages').insert({"user_id": numero_str, "user_input": texto, "bot_response": respuesta_ia}).execute()
+            enviar_meta(numero, respuesta_ia)
+            supabase.table('messages').insert({"user_id": numero, "user_input": texto_admin if not es_imagen else "Envió imagen", "bot_response": respuesta_ia}).execute()
 
         return jsonify({"status": "ok"}), 200
     except:
