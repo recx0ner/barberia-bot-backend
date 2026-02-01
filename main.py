@@ -8,7 +8,17 @@ from supabase import create_client
 app = Flask(__name__)
 venezuela_tz = pytz.timezone('America/Caracas')
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN DE LLAVES (ROTACIÓN) ---
+# Extraemos las 3 llaves del panel de Render
+GEMINI_KEYS = [
+    os.environ.get("GEMINI_API_KEY_1"),
+    os.environ.get("GEMINI_API_KEY_2"),
+    os.environ.get("GEMINI_API_KEY_3")
+]
+# Filtramos solo las que no estén vacías
+VALID_KEYS = [k for k in GEMINI_KEYS if k]
+
+# --- RESTO DE CONFIGURACIÓN ---
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
@@ -20,93 +30,72 @@ def enviar_meta(to, text):
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     requests.post(url, headers=headers, json=payload)
 
-# --- GESTIÓN DE IDENTIDAD ---
-def obtener_datos_cliente(id_num):
-    try:
-        # Buscamos en la tabla 'cliente' de tus capturas
-        res = supabase.table('cliente').select('nombre').eq('id', id_num).execute()
-        if res.data and res.data[0]['nombre'] != "Cliente WhatsApp":
-            return res.data[0]['nombre']
-        return None
-    except:
-        return None
-
+# --- GESTIÓN DE BASE DE DATOS ---
 def registrar_o_actualizar_cliente(id_num, nombre_nuevo=None):
     try:
         datos = {"id": id_num, "telefono": str(id_num)}
-        if nombre_nuevo:
-            datos["nombre"] = nombre_nuevo # Actualizamos el nombre real
-        else:
-            datos["nombre"] = "Cliente WhatsApp" # Placeholder inicial
-            
+        if nombre_nuevo: datos["nombre"] = nombre_nuevo
         supabase.table('cliente').upsert(datos).execute()
-    except Exception as e:
-        print(f"🔥 Error al gestionar cliente: {e}")
+    except: pass
 
-# --- AGENDAMIENTO ---
-def registrar_cita_v21(id_num, texto_pedido):
+def registrar_cita_v22(id_num, texto_pedido):
     try:
-        # Usamos tus columnas reales: 'user_id', 'servicio', 'fecha_hora'
         supabase.table('citas').insert({
             "user_id": id_num, 
             "servicio": texto_pedido,
             "fecha_hora": datetime.now(venezuela_tz).isoformat()
         }).execute()
         return "✅ Pedido agendado."
-    except:
-        return "✅ Anotado."
+    except: return "✅ Anotado."
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET': return request.args.get("hub.challenge"), 200
     
     payload = request.json
-    try:
-        entry = payload['entry'][0]['changes'][0]['value']
-        if 'messages' in entry:
-            msg = entry['messages'][0]
-            numero_raw = msg['from']
-            id_num = int(numero_raw)
-            texto_usuario = msg.get('text', {}).get('body', "").strip()
+    try: entry = payload['entry'][0]['changes'][0]['value']
+    except: return jsonify({"status": "no_data"}), 200
 
-            # 1. ¿Cómo se llama?
-            nombre_cliente = obtener_datos_cliente(id_num)
-            
-            # 2. Instrucción para la IA
-            instruccion = f"""{BUSINESS_CONTEXT}
-            DATOS DEL CLIENTE:
-            - Nombre actual: {nombre_cliente if nombre_cliente else "Desconocido"}
-            
-            REGLAS:
-            - Si el Nombre es 'Desconocido', tu prioridad es preguntarle amablemente cómo se llama antes de tomar el pedido.
-            - Si el cliente te dice su nombre, responde confirmando el nombre y añade el tag: [ACCION:NOMBRE:NombreDelCliente]
-            - Si confirma un pedido, usa el tag: [ACCION:AGENDAR]
-            """
-            
-            client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY_1"))
-            response = client.models.generate_content(model='gemini-2.5-flash', 
-                                                     config={'system_instruction': instruccion}, contents=texto_usuario)
-            respuesta_ia = response.text.strip()
+    if 'messages' in entry:
+        msg = entry['messages'][0]
+        numero_raw = msg['from']
+        id_num = int(numero_raw)
+        texto_usuario = msg.get('text', {}).get('body', "").strip()
 
-            # 3. Procesar Acciones
-            if "[ACCION:NOMBRE:" in respuesta_ia:
-                # Extraer el nombre del tag [ACCION:NOMBRE:Ricardo]
-                nuevo_nombre = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
-                registrar_o_actualizar_cliente(id_num, nuevo_nombre)
-                respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
+        # 1. ¿Cómo se llama? (Consulta a Supabase)
+        res_cli = supabase.table('cliente').select('nombre').eq('id', id_num).execute()
+        nombre_cliente = res_cli.data[0]['nombre'] if res_cli.data and res_cli.data[0]['nombre'] != "Cliente WhatsApp" else "Desconocido"
+        
+        # 2. IA CON ROTACIÓN DE LLAVES 🔄
+        # Elegimos una llave al azar de las 3 disponibles
+        api_key_elegida = random.choice(VALID_KEYS)
+        client = genai.Client(api_key=api_key_elegida)
+        
+        instruccion = f"""{BUSINESS_CONTEXT}
+        Cliente: {nombre_cliente}
+        - Si es 'Desconocido', pregunta el nombre.
+        - Si te da su nombre, usa el tag: [ACCION:NOMBRE:Nombre]
+        - Si confirma pedido, usa el tag: [ACCION:AGENDAR]
+        """
+        
+        response = client.models.generate_content(model='gemini-2.5-flash', config={'system_instruction': instruccion}, contents=texto_usuario)
+        respuesta_ia = response.text.strip()
 
-            if "[ACCION:AGENDAR]" in respuesta_ia:
-                registrar_o_actualizar_cliente(id_num) # Aseguramos registro previo
-                feedback = registrar_cita_v21(id_num, texto_usuario)
-                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip() + f"\n\n{feedback}"
+        # 3. PROCESAR ACCIONES
+        if "[ACCION:NOMBRE:" in respuesta_ia:
+            nuevo_nombre = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
+            registrar_o_actualizar_cliente(id_num, nuevo_nombre)
+            respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
-            enviar_meta(numero_raw, respuesta_ia)
-            supabase.table('messages').insert({"user_id": id_num, "user_input": texto_usuario, "bot_response": respuesta_ia}).execute()
+        if "[ACCION:AGENDAR]" in respuesta_ia:
+            registrar_o_actualizar_cliente(id_num)
+            feedback = registrar_cita_v22(id_num, texto_usuario)
+            respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip() + f"\n\n{feedback}"
 
-        return jsonify({"status": "ok"}), 200
-    except:
-        traceback.print_exc()
-        return jsonify({"status": "error"}), 500
+        enviar_meta(numero_raw, respuesta_ia)
+        supabase.table('messages').insert({"user_id": id_num, "user_input": texto_usuario, "bot_response": respuesta_ia}).execute()
+
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
