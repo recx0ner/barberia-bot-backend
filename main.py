@@ -6,104 +6,90 @@ from google import genai
 from supabase import create_client
 
 app = Flask(__name__)
-
-# --- CONFIGURACIÓN DE ZONA HORARIA ---
 venezuela_tz = pytz.timezone('America/Caracas')
 
-# --- CONFIGURACIÓN CENTRAL ---
+# --- CONFIGURACIÓN ---
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
+ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER") # Tu número personal
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres el asistente de Pizzas El Guaro.")
 
-# --- 1. FUNCIÓN DE MEMORIA ---
-def obtener_contexto(user_id):
+# --- FUNCIONES DE ENVÍO ---
+def enviar_meta(to, text):
+    url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
+    headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+    return requests.post(url, headers=headers, json=payload)
+
+# --- LÓGICA DE NEGOCIO ---
+def gestionar_pedido(user_id, accion, texto=""):
     try:
-        # Recuperamos historial para que el bot no olvide qué pidió el cliente
-        res = supabase.table('messages').select('user_input, bot_response')\
-            .eq('user_id', user_id).order('created_at', desc=True).limit(8).execute()
+        if accion == "AGENDAR":
+            supabase.table('citas').insert({"user_id": user_id, "detalle": texto, "estado": "pendiente"}).execute()
+            return "✅ Pedido anotado."
         
-        historial = ""
-        for msg in reversed(res.data):
-            historial += f"Cliente: {msg['user_input']}\nBot: {msg['bot_response']}\n"
-        return historial
-    except:
-        return ""
-
-# --- 2. FUNCIÓN DE AGENDAMIENTO (La que faltaba) ---
-def ejecutar_agendamiento(user_id, texto_pedido):
-    try:
-        # Inserta el pedido en tu tabla 'citas'
-        # Nota: Asegúrate de que tu tabla en Supabase tenga estas columnas
-        supabase.table('citas').insert({
-            "user_id": user_id, 
-            "detalle": texto_pedido,
-            "estado": "pendiente"
-        }).execute()
-        print(f"📅 PEDIDO REGISTRADO: {user_id}")
-        return True
+        elif accion == "CANCELAR":
+            # Cambia el estado de la última cita pendiente a 'cancelado'
+            supabase.table('citas').update({"estado": "cancelado"}).eq("user_id", user_id).eq("estado", "pendiente").execute()
+            return "🗑️ Tu pedido ha sido cancelado con éxito."
+        
+        elif accion == "PAGO":
+            # Extraer solo números de la referencia (mínimo 6-8 dígitos para seguridad)
+            ref = ''.join(filter(str.isdigit, texto))
+            if len(ref) < 4: return "⚠️ Referencia de pago muy corta o inválida."
+            
+            supabase.table('pagos').insert({"user_id": user_id, "referencia": ref}).execute()
+            # NOTIFICAR AL ADMIN [Nueva función solicitada]
+            enviar_meta(ADMIN_PHONE, f"🔔 *NUEVO PAGO*\nCliente: {user_id}\nRef: {ref}\n\nResponde con 'CONFIRMAR {ref}' para validar.")
+            return "⏳ Referencia recibida. El administrador verificará el pago en breve."
     except Exception as e:
-        print(f"🔥 Error al agendar: {e}")
-        return False
+        print(f"🔥 Error en DB: {e}")
+        return "⚠️ Hubo un detalle técnico, intenta de nuevo."
 
-# --- 3. WEBHOOK PRINCIPAL ---
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
-    if request.method == 'GET':
-        return request.args.get("hub.challenge"), 200
-
+    if request.method == 'GET': return request.args.get("hub.challenge"), 200
+    
     payload = request.json
     try:
         entry = payload['entry'][0]['changes'][0]['value']
         if 'messages' in entry:
             msg = entry['messages'][0]
             numero = msg['from']
-            texto_usuario = msg.get('text', {}).get('body', "")
+            texto = msg.get('text', {}).get('body', "").strip()
+            ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S')
 
-            # Obtener hora de Venezuela para evitar desfases
-            ahora_ve = datetime.now(venezuela_tz)
-            fecha_hora_str = ahora_ve.strftime('%Y-%m-%d %H:%M:%S')
+            # 1. Lógica especial para el Administrador
+            if numero == ADMIN_PHONE and texto.upper().startswith("CONFIRMAR"):
+                ref_confirmar = texto.split()[-1]
+                # Buscar al cliente dueño de esa referencia
+                pago_data = supabase.table('pagos').update({"verificado": True}).eq("referencia", ref_confirmar).execute()
+                if pago_data.data:
+                    cliente_id = pago_data.data[0]['user_id']
+                    enviar_meta(cliente_id, "✅ *¡Pago verificado!* Estamos preparando tu pedido ahora mismo. 🍕")
+                    return jsonify({"status": "confirmed"}), 200
 
-            memoria = obtener_contexto(numero)
-
-            # Instrucción Maestra para la IA
-            instruccion_maestra = f"""
-            {BUSINESS_CONTEXT}
-            Hora en Venezuela: {fecha_hora_str}
-            
-            HISTORIAL:
-            {memoria}
-            
-            REGLAS DE ACCIÓN:
-            - Si el cliente confirma un pedido o cita (ej: "quiero una pizza"), agrega al FINAL de tu respuesta: [ACCION:AGENDAR]
-            """
+            # 2. Lógica para Clientes (IA)
+            instruccion = f"""{BUSINESS_CONTEXT}\nHora VZLA: {ahora_ve}\n
+            REGLAS: 
+            - Si cancela el pedido: [ACCION:CANCELAR]
+            - Si confirma pedido nuevo: [ACCION:AGENDAR]
+            - Si envía referencia de pago: [ACCION:PAGO]"""
 
             client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY_1"))
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                config={'system_instruction': instruccion_maestra},
-                contents=texto_usuario
-            )
+            response = client.models.generate_content(model='gemini-2.5-flash', 
+                                                     config={'system_instruction': instruccion}, contents=texto)
             respuesta_ia = response.text.strip()
 
-            # --- LÓGICA DE ACTIVACIÓN DE AGENDAMIENTO ---
-            if "[ACCION:AGENDAR]" in respuesta_ia:
-                exito = ejecutar_agendamiento(numero, texto_usuario)
-                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip()
-                if exito:
-                    respuesta_ia += "\n\n✅ *Pedido anotado en nuestro sistema.*"
+            # 3. Procesar Tags de Acción
+            for tag in ["AGENDAR", "CANCELAR", "PAGO"]:
+                if f"[ACCION:{tag}]" in respuesta_ia:
+                    feedback = gestionar_pedido(numero, tag, texto)
+                    respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
 
-            # Enviar respuesta por Meta
-            url_meta = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
-            requests.post(url_meta, headers={"Authorization": f"Bearer {META_TOKEN}"}, 
-                          json={"messaging_product": "whatsapp", "to": numero, "text": {"body": respuesta_ia}})
-
-            # Guardar registro en Supabase
-            supabase.table('messages').insert({
-                "user_id": numero, 
-                "user_input": texto_usuario, 
-                "bot_response": respuesta_ia
-            }).execute()
+            enviar_meta(numero, respuesta_ia)
+            supabase.table('messages').insert({"user_id": numero, "user_input": texto, "bot_response": respuesta_ia}).execute()
 
         return jsonify({"status": "ok"}), 200
     except:
