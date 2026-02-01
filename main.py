@@ -6,18 +6,18 @@ from supabase import create_client
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN CENTRAL ---
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres el asistente de Pizzas El Guaro.")
 
-# --- LÓGICA DE MEMORIA ---
-def obtener_memoria(user_id):
+# --- FUNCIÓN DE MEMORIA (Extrae historial de Supabase) ---
+def obtener_contexto(user_id):
     try:
-        # Buscamos los últimos 6 mensajes para dar contexto
+        # Traemos los últimos 8 mensajes para que el bot no pierda el hilo
         res = supabase.table('messages').select('user_input, bot_response')\
-            .eq('user_id', user_id).order('created_at', desc=True).limit(6).execute()
+            .eq('user_id', user_id).order('created_at', desc=True).limit(8).execute()
         
         historial = ""
         for msg in reversed(res.data):
@@ -26,13 +26,19 @@ def obtener_memoria(user_id):
     except:
         return ""
 
-# --- LÓGICA DE AGENDAMIENTO ---
-def registrar_cita(user_id, detalle):
-    # Inserta en la tabla 'citas' que vimos en tu Supabase
-    supabase.table('citas').insert({"user_id": user_id, "detalle": detalle}).execute()
-    print(f"📅 Cita agendada para {user_id}")
+# --- FUNCIÓN DE ACCIÓN (Agendar en la tabla 'citas') ---
+def ejecutar_agendamiento(user_id, texto):
+    try:
+        # Registramos el detalle en tu tabla de citas
+        supabase.table('citas').insert({
+            "user_id": user_id, 
+            "detalle": f"Pedido/Cita detectada: {texto}"
+        }).execute()
+        return True
+    except:
+        return False
 
-# --- WEBHOOK ACTUALIZADO ---
+# --- WEBHOOK ---
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET':
@@ -40,51 +46,53 @@ def webhook():
 
     payload = request.json
     try:
-        # 1. Extracción de datos de Meta
         entry = payload['entry'][0]['changes'][0]['value']
         if 'messages' in entry:
             msg = entry['messages'][0]
             numero = msg['from']
             texto_usuario = msg.get('text', {}).get('body', "")
 
-            # 2. Recuperar Memoria
-            contexto_previo = obtener_memoria(numero)
+            # 1. Recuperamos lo que hablamos antes con este cliente
+            memoria = obtener_contexto(numero)
 
-            # 3. Instrucción Maestra para Gemini
-            instruccion = f"""
+            # 2. Preparamos a la IA con memoria e instrucciones de acción
+            instruccion_maestra = f"""
             {BUSINESS_CONTEXT}
-            Fecha/Hora actual: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+            Hora actual: {datetime.now().strftime('%H:%M')}
             
-            HISTORIAL RECIENTE:
-            {contexto_previo}
+            HISTORIAL DE LA CHARLA:
+            {memoria}
             
-            REGLAS DE ACCIÓN:
-            - Si el cliente confirma un pedido o cita, finaliza tu respuesta con el tag: [ACCION:AGENDAR]
-            - Si el cliente envía una referencia de pago móvil, finaliza con: [ACCION:PAGO]
+            REGLAS DE ORO:
+            - Si el cliente confirma un pedido o cita, pon al final de tu respuesta: [ACCION:AGENDAR]
+            - Si el cliente envía una referencia de pago móvil, pon al final: [ACCION:PAGO]
             """
 
-            # 4. Generar Respuesta con IA
-            client = genai.Client(api_key=random.choice([os.environ.get("GEMINI_API_KEY_1")]))
+            client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY_1"))
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
-                config={'system_instruction': instruccion},
+                config={'system_instruction': instruccion_maestra},
                 contents=texto_usuario
             )
             respuesta_ia = response.text.strip()
 
-            # 5. Ejecutar Acciones si la IA lo ordena
+            # 3. Procesar Acciones (Si la IA puso el "tag")
+            info_adicional = ""
             if "[ACCION:AGENDAR]" in respuesta_ia:
-                registrar_cita(numero, texto_usuario)
-                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "✅ ¡Pedido registrado en sistema!")
+                ejecutar_agendamiento(numero, texto_usuario)
+                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip()
+                info_adicional = " (📅 Agendado)"
 
-            # 6. Responder por Meta
+            # 4. Enviar respuesta por el número oficial de Meta
             url_meta = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
             requests.post(url_meta, headers={"Authorization": f"Bearer {META_TOKEN}"}, 
                           json={"messaging_product": "whatsapp", "to": numero, "text": {"body": respuesta_ia}})
 
-            # 7. Guardar nuevo mensaje en Supabase
+            # 5. Guardar en Supabase para la próxima vez
             supabase.table('messages').insert({
-                "user_id": numero, "user_input": texto_usuario, "bot_response": respuesta_ia
+                "user_id": numero, 
+                "user_input": texto_usuario, 
+                "bot_response": respuesta_ia + info_adicional
             }).execute()
 
         return jsonify({"status": "ok"}), 200
