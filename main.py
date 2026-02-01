@@ -1,10 +1,15 @@
 import os, random, requests, traceback
 from datetime import datetime
+import pytz # <--- Librería para zonas horarias
 from flask import Flask, request, jsonify
 from google import genai 
 from supabase import create_client
 
 app = Flask(__name__)
+
+# --- CONFIGURACIÓN DE ZONA HORARIA ---
+# Definimos la zona horaria de Venezuela (UTC-4)
+venezuela_tz = pytz.timezone('America/Caracas')
 
 # --- CONFIGURACIÓN CENTRAL ---
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
@@ -12,10 +17,9 @@ META_PHONE_ID = os.environ.get("META_PHONE_ID")
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT", "Eres el asistente de Pizzas El Guaro.")
 
-# --- FUNCIÓN DE MEMORIA (Extrae historial de Supabase) ---
+# --- LÓGICA DE MEMORIA ---
 def obtener_contexto(user_id):
     try:
-        # Traemos los últimos 8 mensajes para que el bot no pierda el hilo
         res = supabase.table('messages').select('user_input, bot_response')\
             .eq('user_id', user_id).order('created_at', desc=True).limit(8).execute()
         
@@ -25,18 +29,6 @@ def obtener_contexto(user_id):
         return historial
     except:
         return ""
-
-# --- FUNCIÓN DE ACCIÓN (Agendar en la tabla 'citas') ---
-def ejecutar_agendamiento(user_id, texto):
-    try:
-        # Registramos el detalle en tu tabla de citas
-        supabase.table('citas').insert({
-            "user_id": user_id, 
-            "detalle": f"Pedido/Cita detectada: {texto}"
-        }).execute()
-        return True
-    except:
-        return False
 
 # --- WEBHOOK ---
 @app.route('/whatsapp', methods=['POST', 'GET'])
@@ -52,20 +44,25 @@ def webhook():
             numero = msg['from']
             texto_usuario = msg.get('text', {}).get('body', "")
 
-            # 1. Recuperamos lo que hablamos antes con este cliente
+            # 1. OBTENER HORA REAL DE VENEZUELA
+            ahora_ve = datetime.now(venezuela_tz)
+            fecha_hora_str = ahora_ve.strftime('%Y-%m-%d %H:%M:%S')
+
             memoria = obtener_contexto(numero)
 
-            # 2. Preparamos a la IA con memoria e instrucciones de acción
+            # 2. Instrucción con la hora corregida
             instruccion_maestra = f"""
             {BUSINESS_CONTEXT}
-            Hora actual: {datetime.now().strftime('%H:%M')}
+            
+            UBICACIÓN Y TIEMPO:
+            - Estás en Venezuela.
+            - Fecha y Hora actual: {fecha_hora_str} (No uses la hora del sistema UTC)
             
             HISTORIAL DE LA CHARLA:
             {memoria}
             
-            REGLAS DE ORO:
-            - Si el cliente confirma un pedido o cita, pon al final de tu respuesta: [ACCION:AGENDAR]
-            - Si el cliente envía una referencia de pago móvil, pon al final: [ACCION:PAGO]
+            REGLAS:
+            - Si el cliente confirma pedido, usa: [ACCION:AGENDAR]
             """
 
             client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY_1"))
@@ -76,23 +73,16 @@ def webhook():
             )
             respuesta_ia = response.text.strip()
 
-            # 3. Procesar Acciones (Si la IA puso el "tag")
-            info_adicional = ""
-            if "[ACCION:AGENDAR]" in respuesta_ia:
-                ejecutar_agendamiento(numero, texto_usuario)
-                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip()
-                info_adicional = " (📅 Agendado)"
-
-            # 4. Enviar respuesta por el número oficial de Meta
+            # 3. Enviar respuesta por Meta
             url_meta = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
             requests.post(url_meta, headers={"Authorization": f"Bearer {META_TOKEN}"}, 
                           json={"messaging_product": "whatsapp", "to": numero, "text": {"body": respuesta_ia}})
 
-            # 5. Guardar en Supabase para la próxima vez
+            # 4. Guardar en Supabase
             supabase.table('messages').insert({
                 "user_id": numero, 
                 "user_input": texto_usuario, 
-                "bot_response": respuesta_ia + info_adicional
+                "bot_response": respuesta_ia
             }).execute()
 
         return jsonify({"status": "ok"}), 200
