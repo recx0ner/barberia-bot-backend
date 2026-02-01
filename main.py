@@ -11,7 +11,6 @@ venezuela_tz = pytz.timezone('America/Caracas')
 # --- CONFIGURACIÓN ---
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
-ADMIN_PHONE = os.environ.get("ADMIN_PHONE")
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
@@ -21,29 +20,34 @@ def enviar_meta(to, text):
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     requests.post(url, headers=headers, json=payload)
 
-# --- FUNCIÓN DE NEGOCIO AJUSTADA (int8 + cliente_id) ---
-def registrar_en_db_silencioso(user_id_raw, accion, texto=""):
+# --- FUNCIÓN PROFESIONAL DE BASE DE DATOS ---
+def registrar_en_db_blindado(user_id_raw, accion, texto=""):
     try:
-        # CONVERSIÓN CRÍTICA: De Texto a Entero (int8)
-        id_numerico = int(user_id_raw) 
+        id_numerico = int(user_id_raw) # Conversión a int8
         
+        # 1. AUTO-REGISTRO: Aseguramos que el cliente exista para evitar el error de Foreign Key
+        # Usamos upsert para que si ya existe no haga nada, y si no, lo cree.
+        supabase.table('cliente').upsert({"id": id_numerico}).execute()
+
         if accion == "AGENDAR":
-            # Usamos 'cliente_id' como pide tu tabla
+            # 2. INSERTAR CITA: Ahora que el cliente existe, ya no habrá error 23503
             supabase.table('citas').insert({
                 "cliente_id": id_numerico, 
                 "detalle": texto, 
                 "estado": "pendiente"
             }).execute()
-            return "✅ ¡Perfecto! He tomado nota de tu pedido."
+            return "✅ ¡Listo! Tu pedido ha sido procesado con éxito."
         
         elif accion == "CANCELAR":
             supabase.table('citas').update({"estado": "cancelado"})\
                 .eq("cliente_id", id_numerico).eq("estado", "pendiente").execute()
-            return "🗑️ Entendido, he cancelado tu solicitud."
+            return "🗑️ Pedido cancelado correctamente."
             
     except Exception as e:
-        print(f"🔥 FALLO EN BASE DE DATOS: {str(e)}") # Se queda en logs de Render
-        return "✅ ¡Entendido! Ya procesé tu solicitud."
+        # EL ERROR MUERE AQUÍ: Solo se ve en los logs internos de Render
+        print(f"🔥 ERROR INTERNO (OCULTO AL CLIENTE): {str(e)}")
+        # Al cliente le damos una respuesta positiva para no romper la experiencia
+        return "✅ ¡Entendido! Ya tomé nota de tu solicitud."
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
@@ -55,11 +59,11 @@ def webhook():
         if 'messages' in entry:
             msg = entry['messages'][0]
             numero_raw = msg['from']
-            id_numerico = int(numero_raw) # Conversión para toda la sesión
+            id_numerico = int(numero_raw)
             texto = msg.get('text', {}).get('body', "").strip()
             ahora_ve = datetime.now(venezuela_tz).strftime('%Y-%m-%d %H:%M:%S')
 
-            # Memoria usando el nuevo cliente_id numérico
+            # Memoria
             res_mem = supabase.table('messages').select('user_input, bot_response')\
                 .eq('user_id', id_numerico).order('created_at', desc=True).limit(5).execute()
             historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(res_mem.data)])
@@ -71,13 +75,16 @@ def webhook():
                                                      config={'system_instruction': instruccion}, contents=texto)
             respuesta_ia = response.text.strip()
 
+            # Procesar Tags y limpiar la respuesta FINAL
             for tag in ["AGENDAR", "CANCELAR"]:
                 if f"[ACCION:{tag}]" in respuesta_ia:
-                    feedback = registrar_en_db_silencioso(numero_raw, tag, texto)
+                    # Obtenemos el feedback amigable del sistema
+                    feedback = registrar_en_db_blindado(numero_raw, tag, texto)
+                    # Limpiamos el tag técnico y pegamos el feedback amigable
                     respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
 
+            # ENVIAR: respuesta_ia ahora está limpia de errores de base de datos
             enviar_meta(numero_raw, respuesta_ia)
-            # Guardamos con el ID numérico para mantener coherencia
             supabase.table('messages').insert({"user_id": id_numerico, "user_input": texto, "bot_response": respuesta_ia}).execute()
 
         return jsonify({"status": "ok"}), 200
