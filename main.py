@@ -28,21 +28,39 @@ def enviar_meta(to, text):
     requests.post(url, headers=headers, json=payload)
 
 def generar_respuesta_ia(instruccion, texto_usuario):
+    # 1. Obtenemos las llaves disponibles
     llaves = VALID_KEYS[:]
-    random.shuffle(llaves) #
-    for key in llaves:
+    if not llaves:
+        print("❌ ERROR: No hay ninguna GEMINI_API_KEY configurada en Render.")
+        return "Error de configuración: No hay llaves de IA disponibles."
+    
+    # 2. Mezclamos para distribuir la carga
+    random.shuffle(llaves)
+    
+    # 3. Probamos una por una
+    for i, key in enumerate(llaves):
         try:
             client = genai.Client(api_key=key)
             response = client.models.generate_content(
-                model='gemini-2.5-flash', 
+                model='gemini-2.0-flash', # Actualizado a la versión más estable
                 config={'system_instruction': instruccion}, 
                 contents=texto_usuario
             )
-            return response.text.strip()
+            # Si tiene éxito, devolvemos el texto
+            if response.text:
+                return response.text.strip()
+            return "La IA devolvió una respuesta vacía."
+            
         except errors.ClientError as e:
-            if "429" in str(e): continue
-            raise e
-    return "Estamos horneando demasiadas peticiones, intenta en un momento."
+            # Si es error de cuota (429), intentamos con la siguiente
+            if "429" in str(e):
+                print(f"⚠️ Llave {i+1} agotada (429). Probando la siguiente...")
+                continue
+            # Si es otro error, lo reportamos
+            print(f"🔥 Error crítico en IA: {e}")
+            break 
+
+    return "🥪 *Pizzas El Guaro:* Estamos horneando demasiadas peticiones al mismo tiempo. ¡Danos un minuto y vuelve a intentarlo!"
 
 def ejecutar_logica(id_num, accion, texto_cliente="", nombre_actual="Cliente"):
     conn = get_db_connection()
