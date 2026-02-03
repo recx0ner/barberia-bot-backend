@@ -10,7 +10,6 @@ app = Flask(__name__)
 venezuela_tz = pytz.timezone('America/Caracas')
 
 # --- CONFIGURACIÓN CENTRAL ---
-# Asegúrate de haber puesto esta variable en Render
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
 VALID_KEYS = [k for k in GEMINI_KEYS if k]
@@ -20,7 +19,7 @@ ADMIN_PHONE = os.environ.get("ADMIN_PHONE")
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
 def get_db_connection():
-    # Usamos psycopg2 correctamente escrito para conectar a Neon
+    # Conexión corregida para psycopg2-binary
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def enviar_meta(to, text):
@@ -31,11 +30,15 @@ def enviar_meta(to, text):
 
 def generar_respuesta_ia(instruccion, texto_usuario):
     llaves = VALID_KEYS[:]
-    random.shuffle(llaves) # Rotación para evitar Error 429
+    random.shuffle(llaves) # Evita el error 429
     for key in llaves:
         try:
             client = genai.Client(api_key=key)
-            response = client.models.generate_content(model='gemini-2.5-flash', config={'system_instruction': instruccion}, contents=texto_usuario)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash', 
+                config={'system_instruction': instruccion}, 
+                contents=texto_usuario
+            )
             return response.text.strip()
         except errors.ClientError as e:
             if "429" in str(e): continue
@@ -46,27 +49,33 @@ def ejecutar_logica(id_num, accion, texto="", nombre="Cliente"):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Registro de identidad Jorge Perez
+        # Sincronización de identidad
         cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre, str(id_num)))
         
         if accion == "AGENDAR":
             cur.execute("INSERT INTO citas (user_id, nombre, servicio, fecha_hora, estado) VALUES (%s, %s, %s, %s, 'pendiente')",
                         (id_num, nombre, texto[:200], datetime.now(venezuela_tz)))
-            res = "✅ ¡Pedido agendado!"
+            res = "✅ ¡Pedido agendado en cocina!"
+            
         elif accion == "CANCELAR":
+            # Buscamos la última orden pendiente del usuario para cancelarla
             cur.execute("SELECT id, fecha_hora FROM citas WHERE user_id = %s AND estado = 'pendiente' ORDER BY fecha_hora DESC LIMIT 1", (id_num,))
             cita = cur.fetchone()
             if cita:
                 diff = (datetime.now(venezuela_tz) - cita['fecha_hora']).total_seconds() / 60
-                if diff <= 20:
+                if diff <= 20: # Límite de 20 minutos
                     cur.execute("UPDATE citas SET estado = 'cancelado' WHERE id = %s", (cita['id'],))
-                    res = "🗑️ Pedido cancelado."
-                else: res = "⛔ Pasaron más de 20 min."
-            else: res = "❌ Sin pedidos pendientes."
+                    res = f"🗑️ Pedido cancelado con éxito (hace {int(diff)} min)."
+                else:
+                    res = "⛔ Lo siento, ya pasaron más de 20 min y no se puede cancelar."
+            else:
+                res = "❌ No encontré ningún pedido pendiente para cancelar."
+        
         conn.commit()
         return res
     except Exception as e:
         conn.rollback()
+        print(f"🔥 Error en DB: {e}")
         return "✅ Procesado."
     finally:
         cur.close()
@@ -81,56 +90,64 @@ def webhook():
         if 'messages' in entry:
             msg = entry['messages'][0]
             
-            # Filtro de frescura
+            # Filtro de frescura para evitar mensajes antiguos
             if int(datetime.now(pytz.utc).timestamp()) - int(msg.get('timestamp', 0)) > 300:
                 return jsonify({"status": "old"}), 200
 
             numero = msg['from']
             id_num = int(numero)
-            texto = msg.get('text', {}).get('body', "").strip()
+            texto_cliente = msg.get('text', {}).get('body', "").strip()
 
             conn = get_db_connection()
             cur = conn.cursor()
             
+            # 1. Verificar si el bot está encendido
             cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
             bot_active = cur.fetchone()['value']
             
+            # 2. Comandos de Administrador
             if ADMIN_PHONE and numero == ADMIN_PHONE:
-                if texto.upper() == "/BOT_OFF":
+                if texto_cliente.upper() == "/BOT_OFF":
                     cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'")
                     conn.commit()
-                    enviar_meta(numero, "😴 Bot apagado.")
+                    enviar_meta(numero, "😴 Bot desactivado.")
                     return jsonify({"status": "ok"}), 200
-                elif texto.upper() == "/BOT_ON":
+                elif texto_cliente.upper() == "/BOT_ON":
                     cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'")
                     conn.commit()
-                    enviar_meta(numero, "🤖 Bot encendido.")
+                    enviar_meta(numero, "🤖 Bot activado.")
                     return jsonify({"status": "ok"}), 200
 
             if bot_active == 'false': return jsonify({"status": "off"}), 200
 
-            # Memoria del chat Jorge Perez
+            # 3. Identidad y Memoria del Cliente
             cur.execute("SELECT nombre FROM cliente WHERE id = %s", (id_num,))
             cli = cur.fetchone()
-            nombre = cli['nombre'] if cli else "Desconocido"
+            nombre_actual = cli['nombre'] if cli else "Desconocido"
             
             cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY created_at DESC LIMIT 5", (id_num,))
             historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(cur.fetchall())])
 
-            instruccion = f"{BUSINESS_CONTEXT}\nCliente: {nombre}\nHistorial:\n{historial}\nTags: [ACCION:AGENDAR], [ACCION:NOMBRE:Nombre], [ACCION:CANCELAR]"
-            respuesta_ia = generar_respuesta_ia(instruccion, texto)
+            # 4. Procesar con IA
+            instruccion = f"{BUSINESS_CONTEXT}\nCliente: {nombre_actual}\nHistorial:\n{historial}\nTags: [ACCION:AGENDAR], [ACCION:NOMBRE:Nombre], [ACCION:CANCELAR]"
+            respuesta_ia = generar_respuesta_ia(instruccion, texto_cliente)
 
+            # 5. Ejecutar y LIMPIAR etiquetas (Esto evita el error de image_f07180.png)
             if "[ACCION:NOMBRE:" in respuesta_ia:
-                nombre = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
-                cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre, numero))
+                nombre_actual = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
+                cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre_actual, numero))
                 respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
-            if "[ACCION:AGENDAR]" in respuesta_ia:
-                feedback = ejecutar_logica(id_num, "AGENDAR", texto, nombre)
-                respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip() + f"\n\n{feedback}"
+            accion_procesada = False
+            for tag in ["CANCELAR", "AGENDAR"]:
+                if f"[ACCION:{tag}]" in respuesta_ia and not accion_procesada:
+                    feedback = ejecutar_logica(id_num, tag, texto_cliente, nombre_actual)
+                    # Eliminamos la etiqueta para que el cliente no la vea
+                    respuesta_ia = respuesta_ia.replace(f"[ACCION:{tag}]", "").strip() + f"\n\n{feedback}"
+                    accion_procesada = True
 
             enviar_meta(numero, respuesta_ia)
-            cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto, respuesta_ia))
+            cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto_cliente, respuesta_ia))
             conn.commit()
             cur.close()
             conn.close()
