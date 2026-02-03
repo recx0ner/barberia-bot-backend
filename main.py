@@ -9,10 +9,9 @@ from google.genai import errors
 app = Flask(__name__)
 venezuela_tz = pytz.timezone('America/Caracas')
 
-# --- CONFIGURACIÓN DE NEON (Obtén la URL en tu panel de Neon) ---
+# --- CONFIGURACIÓN CENTRAL ---
+# Asegúrate de haber puesto esta variable en Render
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# --- RESTO DE CONFIGURACIÓN ---
 GEMINI_KEYS = [os.environ.get(f"GEMINI_API_KEY_{i}") for i in range(1, 4)]
 VALID_KEYS = [k for k in GEMINI_KEYS if k]
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
@@ -21,6 +20,7 @@ ADMIN_PHONE = os.environ.get("ADMIN_PHONE")
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
 def get_db_connection():
+    # Usamos psycopg2 correctamente escrito para conectar a Neon
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def enviar_meta(to, text):
@@ -31,7 +31,7 @@ def enviar_meta(to, text):
 
 def generar_respuesta_ia(instruccion, texto_usuario):
     llaves = VALID_KEYS[:]
-    random.shuffle(llaves) #
+    random.shuffle(llaves) # Rotación para evitar Error 429
     for key in llaves:
         try:
             client = genai.Client(api_key=key)
@@ -42,11 +42,11 @@ def generar_respuesta_ia(instruccion, texto_usuario):
             raise e
     return "Lo siento, estamos horneando demasiadas peticiones."
 
-# --- LÓGICA DE NEGOCIO ---
-def ejecutar_accion(id_num, accion, texto="", nombre="Cliente"):
+def ejecutar_logica(id_num, accion, texto="", nombre="Cliente"):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # Registro de identidad Jorge Perez
         cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre, str(id_num)))
         
         if accion == "AGENDAR":
@@ -62,7 +62,7 @@ def ejecutar_accion(id_num, accion, texto="", nombre="Cliente"):
                     cur.execute("UPDATE citas SET estado = 'cancelado' WHERE id = %s", (cita['id'],))
                     res = "🗑️ Pedido cancelado."
                 else: res = "⛔ Pasaron más de 20 min."
-            else: res = "❌ Sin pedidos."
+            else: res = "❌ Sin pedidos pendientes."
         conn.commit()
         return res
     except Exception as e:
@@ -76,21 +76,40 @@ def ejecutar_accion(id_num, accion, texto="", nombre="Cliente"):
 def webhook():
     if request.method == 'GET': return request.args.get("hub.challenge"), 200
     payload = request.json
-    conn = get_db_connection()
-    cur = conn.cursor()
     try:
         entry = payload['entry'][0]['changes'][0]['value']
         if 'messages' in entry:
             msg = entry['messages'][0]
+            
+            # Filtro de frescura
+            if int(datetime.now(pytz.utc).timestamp()) - int(msg.get('timestamp', 0)) > 300:
+                return jsonify({"status": "old"}), 200
+
             numero = msg['from']
             id_num = int(numero)
             texto = msg.get('text', {}).get('body', "").strip()
 
-            # Verificar Bot ON/OFF
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
             cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
-            if cur.fetchone()['value'] == 'false' and numero != ADMIN_PHONE: return jsonify({"status": "off"}), 200
+            bot_active = cur.fetchone()['value']
+            
+            if ADMIN_PHONE and numero == ADMIN_PHONE:
+                if texto.upper() == "/BOT_OFF":
+                    cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'")
+                    conn.commit()
+                    enviar_meta(numero, "😴 Bot apagado.")
+                    return jsonify({"status": "ok"}), 200
+                elif texto.upper() == "/BOT_ON":
+                    cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'")
+                    conn.commit()
+                    enviar_meta(numero, "🤖 Bot encendido.")
+                    return jsonify({"status": "ok"}), 200
 
-            # Recuperar Identidad y Memoria
+            if bot_active == 'false': return jsonify({"status": "off"}), 200
+
+            # Memoria del chat Jorge Perez
             cur.execute("SELECT nombre FROM cliente WHERE id = %s", (id_num,))
             cli = cur.fetchone()
             nombre = cli['nombre'] if cli else "Desconocido"
@@ -107,20 +126,19 @@ def webhook():
                 respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
             if "[ACCION:AGENDAR]" in respuesta_ia:
-                feedback = ejecutar_accion(id_num, "AGENDAR", texto, nombre)
+                feedback = ejecutar_logica(id_num, "AGENDAR", texto, nombre)
                 respuesta_ia = respuesta_ia.replace("[ACCION:AGENDAR]", "").strip() + f"\n\n{feedback}"
 
             enviar_meta(numero, respuesta_ia)
             cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto, respuesta_ia))
             conn.commit()
+            cur.close()
+            conn.close()
 
         return jsonify({"status": "ok"}), 200
     except:
         traceback.print_exc()
         return jsonify({"status": "error"}), 500
-    finally:
-        cur.close()
-        conn.close()
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
