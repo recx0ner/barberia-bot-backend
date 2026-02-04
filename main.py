@@ -15,7 +15,7 @@ META_PHONE_ID = os.environ.get("META_PHONE_ID")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE")
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
-MODELO_IA = "google/gemini-2.5-flash"
+MODELO_IA = "google/gemini-2.5-flash" #
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -47,25 +47,28 @@ def generar_respuesta_ia(instruccion, texto_usuario, img_b64=None):
     except: return "Error de conexión con la IA."
 
 def ejecutar_logica_negocio(id_num, accion, texto_cliente="", nombre_actual="Cliente", extra_data=None):
+    """Maneja registros en Neon (Citas y Pagos con Banco)"""
     conn = get_db_connection(); cur = conn.cursor()
     try:
         cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre_actual, str(id_num)))
         
         if accion == "AGENDAR":
             cur.execute("INSERT INTO citas (user_id, nombre, servicio, fecha_hora, estado) VALUES (%s, %s, %s, %s, 'pendiente')", (id_num, nombre_actual, texto_cliente[:200], datetime.now(venezuela_tz)))
-            return "✅ Pedido agendado. Esperando pago."
+            return "✅ Pedido agendado. Esperando confirmación de pago móvil."
             
         elif accion == "PAGO" and extra_data:
-            ref, monto = extra_data[0].strip(), extra_data[1].strip()
-            # VALIDACIÓN CRÍTICA: Evita el error de image_fedf79.png
-            if ref.lower() == "ref" or monto.lower() == "monto":
-                return "⚠️ No pude detectar bien los datos del pago. ¿Podrías escribirlos de nuevo claramente?"
+            ref, monto, banco = extra_data[0].strip(), extra_data[1].strip(), extra_data[2].strip()
+            # Validación para evitar datos de ejemplo
+            if ref.lower() == "ref" or "monto" in monto.lower():
+                return "⚠️ No pude leer bien los datos. ¿Me indicas el banco, la referencia y el monto en Bs.?"
             
-            cur.execute("INSERT INTO pagos (user_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (id_num, ref, monto))
+            cur.execute("INSERT INTO pagos (user_id, referencia, monto, banco, estado) VALUES (%s, %s, %s, %s, 'pendiente')", (id_num, ref, monto, banco))
             conn.commit()
-            msg_admin = f"⚠️ *PAGO POR VERIFICAR*\n👤 Cliente: {nombre_actual}\n💰 Monto: {monto}\n🔢 Ref: {ref}\n\nResponde con un 'sí' o 'listo' para confirmar."
+            
+            # Notificación mejorada para el Admin
+            msg_admin = f"⚠️ *PAGO MÓVIL RECIBIDO*\n👤 Cliente: {nombre_actual}\n💰 Monto: {monto}\n🏦 Banco: {banco}\n🔢 Ref: {ref}\n\nResponde 'sí' para confirmar."
             enviar_meta(ADMIN_PHONE, msg_admin)
-            return f"⏳ Referencia {ref} recibida. El administrador la verificará pronto."
+            return f"⏳ Referencia {ref} de {banco} recibida. Validaremos el ingreso en Bs. y te avisaré."
             
         conn.commit()
     except: conn.rollback(); return "✅ Procesado."
@@ -88,7 +91,8 @@ def webhook():
             if ADMIN_PHONE and numero == ADMIN_PHONE:
                 cur.execute("SELECT p.referencia, p.user_id, c.nombre FROM pagos p JOIN cliente c ON p.user_id = c.id WHERE p.estado = 'pendiente' ORDER BY p.fecha_pago DESC LIMIT 1")
                 ultimo_pago = cur.fetchone()
-                instruccion_admin = f"Eres el asistente. El último pago es de {ultimo_pago['nombre'] if ultimo_pago else 'nadie'} Ref: {ultimo_pago['referencia'] if ultimo_pago else '0'}. Si el admin confirma (si, ok, listo), responde SOLO [CONFIRMAR:REF]. Si apaga responde [BOT:OFF], si enciende [BOT:ON]."
+                
+                instruccion_admin = f"Eres el asistente. Pago pendiente de {ultimo_pago['nombre'] if ultimo_pago else 'nadie'} Ref: {ultimo_pago['referencia'] if ultimo_pago else '0'}. Si el admin confirma (si, listo, ya llego), responde SOLO [CONFIRMAR:REF]. Control bot: [BOT:OFF]/[BOT:ON]."
                 res_admin = generar_respuesta_ia(instruccion_admin, texto_cliente)
 
                 if "[CONFIRMAR:REF]" in res_admin and ultimo_pago:
@@ -96,14 +100,14 @@ def webhook():
                     cur.execute("UPDATE pagos SET estado = 'confirmado' WHERE referencia = %s", (ref_ok,))
                     cur.execute("UPDATE citas SET estado = 'pagado' WHERE user_id = %s AND estado = 'pendiente'", (ultimo_pago['user_id'],))
                     conn.commit()
-                    enviar_meta(str(ultimo_pago['user_id']), f"✅ *¡Pago Confirmado!* Referencia {ref_ok} válida. ¡Pizza en camino! 🍕")
-                    enviar_meta(ADMIN_PHONE, f"👌 Pago de {ultimo_pago['nombre']} (Ref: {ref_ok}) confirmado."); return jsonify({"status": "ok"}), 200
+                    enviar_meta(str(ultimo_pago['user_id']), f"✅ *¡Pago en Bs. Confirmado!* Tu pizza ya está en el horno. 🍕")
+                    enviar_meta(ADMIN_PHONE, f"👌 Confirmado el pago de {ultimo_pago['nombre']} (Ref: {ref_ok})."); return jsonify({"status": "ok"}), 200
                 elif "[BOT:OFF]" in res_admin:
                     cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'"); conn.commit()
-                    enviar_meta(numero, "😴 Bot apagado."); return jsonify({"status": "ok"}), 200
+                    enviar_meta(numero, "😴 Bot desactivado."); return jsonify({"status": "ok"}), 200
                 elif "[BOT:ON]" in res_admin:
                     cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'"); conn.commit()
-                    enviar_meta(numero, "🤖 Bot reactivado."); return jsonify({"status": "ok"}), 200
+                    enviar_meta(numero, "🤖 Bot encendido."); return jsonify({"status": "ok"}), 200
 
             # --- LÓGICA DE CLIENTE ---
             cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
@@ -114,27 +118,26 @@ def webhook():
             cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY created_at DESC LIMIT 5", (id_num,))
             historial = "\n".join([f"C: {m['user_input']}\nB: {m['bot_response']}" for m in reversed(cur.fetchall())])
 
-            # INSTRUCCIÓN REFORZADA: No usar palabras Ref/Monto literalmente
+            # INSTRUCCIÓN REFORZADA: Foco en Bs. y Banco Emisor
             instruccion = f"""{BUSINESS_CONTEXT}
             Cliente: {nombre_actual}
-            REGLA DE ETIQUETAS:
-            - [ACCION:NOMBRE:NombreReal]
-            - [ACCION:AGENDAR]
-            - [ACCION:PAGO:EscribeAquiLaReferencia:EscribeAquiElMonto]
-            JAMÁS uses la palabra 'Ref' o 'Monto' dentro de los tags. Extrae los números reales.
+            REGLAS DE PAGO (VENEZUELA):
+            - Los pagos son en Bolívares (Bs.).
+            - Si el cliente envía comprobante o texto de pago, extrae: [ACCION:PAGO:Referencia:MontoConBs:BancoEmisor].
+            - Bancos comunes: Banesco, Mercantil, Provincial, Venezuela, etc.
+            - Otras etiquetas: [ACCION:NOMBRE:NombreReal], [ACCION:AGENDAR].
             """
             respuesta_ia = generar_respuesta_ia(instruccion, texto_cliente, img_data)
 
             if "[ACCION:NOMBRE:" in respuesta_ia:
                 nombre_nuevo = respuesta_ia.split("[ACCION:NOMBRE:")[1].split("]")[0]
-                if nombre_nuevo.lower() != "nombre":
-                    nombre_actual = nombre_nuevo
-                    cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre_actual, numero))
+                cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s) ON CONFLICT (id) DO UPDATE SET nombre = EXCLUDED.nombre", (id_num, nombre_nuevo, numero))
                 respuesta_ia = respuesta_ia.split("[ACCION:NOMBRE:")[0].strip()
 
             if "[ACCION:PAGO:" in respuesta_ia:
+                # El tag ahora tiene 3 partes: Ref, Monto, Banco
                 datos = respuesta_ia.split("[ACCION:PAGO:")[1].split("]")[0].split(":")
-                if len(datos) >= 2:
+                if len(datos) >= 3:
                     feedback = ejecutar_logica_negocio(id_num, "PAGO", extra_data=datos, nombre_actual=nombre_actual)
                     respuesta_ia = respuesta_ia.split("[ACCION:PAGO:")[0].strip() + f"\n\n{feedback}"
 
