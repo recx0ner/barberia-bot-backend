@@ -74,6 +74,8 @@ def ejecutar_logica_negocio(id_num, accion, texto_cliente="", nombre_actual="Cli
     except: conn.rollback(); return "✅ Procesado."
     finally: cur.close(); conn.close()
 
+# ... (Partes de importación y configuración iguales) ...
+
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET': return request.args.get("hub.challenge"), 200
@@ -82,17 +84,19 @@ def webhook():
         entry = payload['entry'][0]['changes'][0]['value']
         if 'messages' in entry:
             msg = entry['messages'][0]; numero = msg['from']; id_num = int(numero)
-            texto_cliente = msg.get('text', {}).get('body', "(Imagen)") if msg.get('type') == 'text' else "(Imagen enviada)"
+            texto_cliente = msg.get('text', {}).get('body', "").strip() if msg.get('type') == 'text' else "(Imagen)"
             img_data = descargar_imagen_meta(msg['image']['id']) if msg.get('type') == 'image' else None
 
             conn = get_db_connection(); cur = conn.cursor()
             
-            # --- LÓGICA DE ADMINISTRADOR ---
+            # --- 🛡️ BLINDAJE DE ADMINISTRADOR ---
+            # Si el número es el Admin, procesamos y salimos (return) inmediatamente
             if ADMIN_PHONE and numero == ADMIN_PHONE:
                 cur.execute("SELECT p.referencia, p.user_id, c.nombre FROM pagos p JOIN cliente c ON p.user_id = c.id WHERE p.estado = 'pendiente' ORDER BY p.fecha_pago DESC LIMIT 1")
                 ultimo_pago = cur.fetchone()
                 
-                instruccion_admin = f"Eres el asistente. Pago pendiente de {ultimo_pago['nombre'] if ultimo_pago else 'nadie'} Ref: {ultimo_pago['referencia'] if ultimo_pago else '0'}. Si el admin confirma (si, listo, ya llego), responde SOLO [CONFIRMAR:REF]. Control bot: [BOT:OFF]/[BOT:ON]."
+                # Instrucción muy estricta para que la IA no salude al admin
+                instruccion_admin = f"Eres el asistente interno de Pizzas El Guaro. NO saludes. El último pago es de {ultimo_pago['nombre'] if ultimo_pago else 'nadie'} Ref: {ultimo_pago['referencia'] if ultimo_pago else '0'}. Si el admin confirma (si, ok, listo, ya llego), responde UNICAMENTE [CONFIRMAR:REF]. Si pide apagar [BOT:OFF], si pide encender [BOT:ON]."
                 res_admin = generar_respuesta_ia(instruccion_admin, texto_cliente)
 
                 if "[CONFIRMAR:REF]" in res_admin and ultimo_pago:
@@ -101,13 +105,21 @@ def webhook():
                     cur.execute("UPDATE citas SET estado = 'pagado' WHERE user_id = %s AND estado = 'pendiente'", (ultimo_pago['user_id'],))
                     conn.commit()
                     enviar_meta(str(ultimo_pago['user_id']), f"✅ *¡Pago en Bs. Confirmado!* Tu pizza ya está en el horno. 🍕")
-                    enviar_meta(ADMIN_PHONE, f"👌 Confirmado el pago de {ultimo_pago['nombre']} (Ref: {ref_ok})."); return jsonify({"status": "ok"}), 200
+                    enviar_meta(ADMIN_PHONE, f"👌 He confirmado el pago de {ultimo_pago['nombre']} (Ref: {ref_ok}).")
                 elif "[BOT:OFF]" in res_admin:
                     cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'"); conn.commit()
-                    enviar_meta(numero, "😴 Bot desactivado."); return jsonify({"status": "ok"}), 200
+                    enviar_meta(numero, "😴 Bot apagado.")
                 elif "[BOT:ON]" in res_admin:
                     cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'"); conn.commit()
-                    enviar_meta(numero, "🤖 Bot encendido."); return jsonify({"status": "ok"}), 200
+                    enviar_meta(numero, "🤖 Bot reactivado.")
+                
+                # Importante: Detenemos aquí para que el Admin no sea tratado como cliente
+                cur.close(); conn.close()
+                return jsonify({"status": "admin_processed"}), 200
+
+            # --- 🍕 LÓGICA DE CLIENTE ---
+            # (Aquí va el resto del código que ya tienes para los clientes...)
+# ...
 
             # --- LÓGICA DE CLIENTE ---
             cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
