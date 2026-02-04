@@ -65,7 +65,7 @@ def ejecutar_logica_negocio(id_num, accion, texto_cliente="", nombre_actual="Cli
     except: conn.rollback(); return "✅ Procesado."
     finally: cur.close(); conn.close()
 
-@app.route('/whatsapp', methods=['POST', 'GET'])
+@@app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET': return request.args.get("hub.challenge"), 200
     payload = request.json
@@ -78,32 +78,52 @@ def webhook():
 
             conn = get_db_connection(); cur = conn.cursor()
             
-            # --- 🛡️ LÓGICA EXCLUSIVA DE ADMINISTRADOR ---
+            # --- 🛡️ LÓGICA DE ASISTENTE PARA EL ADMINISTRADOR ---
             if ADMIN_PHONE and numero == ADMIN_PHONE:
-                # Buscamos el último pago pendiente en Neon
-                cur.execute("SELECT p.referencia, p.user_id, c.nombre FROM pagos p JOIN cliente c ON p.user_id = c.id WHERE p.estado = 'pendiente' ORDER BY p.fecha_pago DESC LIMIT 1")
-                pago = cur.fetchone()
+                # 1. Buscamos TODOS los pagos pendientes
+                cur.execute("SELECT p.referencia, p.monto, p.banco, c.nombre FROM pagos p JOIN cliente c ON p.user_id = c.id WHERE p.estado = 'pendiente' ORDER BY p.fecha_pago DESC")
+                pagos_pendientes = cur.fetchall()
                 
-                instruccion_admin = f"Asistente interno. Último pago pendiente de {pago['nombre'] if pago else 'nadie'} Ref: {pago['referencia'] if pago else '0'}. Si el admin confirma (si, ok, listo, ya llego), responde SOLO [CONFIRMAR:REF]. Si pide apagar [BOT:OFF], si encender [BOT:ON]. NO saludes."
+                # 2. IA analiza la intención del Admin
+                instruccion_admin = f"""Eres el asistente de gestión de Pizzas El Guaro. 
+                Tu jefe (el admin) te habla. 
+                Pagos en espera: {len(pagos_pendientes)}.
+                Si pregunta por pendientes, responde [LISTAR:PAGOS].
+                Si confirma un pago ('si', 'listo', 'ok'), responde [CONFIRMAR:REF].
+                Si pide apagar bot [BOT:OFF], si pide encender [BOT:ON].
+                """
                 res_admin = generar_respuesta_ia(instruccion_admin, texto_cliente)
 
-                if "[CONFIRMAR:REF]" in res_admin and pago:
-                    cur.execute("UPDATE pagos SET estado = 'confirmado' WHERE referencia = %s", (pago['referencia'],))
-                    cur.execute("UPDATE citas SET estado = 'pagado' WHERE user_id = %s AND estado = 'pendiente'", (pago['user_id'],))
+                # --- RESPUESTAS AL ADMIN ---
+                if "[LISTAR:PAGOS]" in res_admin:
+                    if not pagos_pendientes:
+                        enviar_meta(ADMIN_PHONE, "✅ No tienes pagos pendientes por aprobar en este momento.")
+                    else:
+                        reporte = "📋 *PAGOS PENDIENTES:*\n"
+                        for p in pagos_pendientes:
+                            reporte += f"• {p['nombre']}: {p['monto']} ({p['banco']}) - Ref: {p['referencia']}\n"
+                        reporte += "\nPara confirmar alguno, dime: 'Sí, confirma el de [Nombre]'"
+                        enviar_meta(ADMIN_PHONE, reporte)
+
+                elif "[CONFIRMAR:REF]" in res_admin and pagos_pendientes:
+                    # Confirmamos el más reciente por defecto o el que la IA identifique
+                    pago_a_confirmar = pagos_pendientes[0] 
+                    cur.execute("UPDATE pagos SET estado = 'confirmado' WHERE referencia = %s", (pago_a_confirmar['referencia'],))
+                    cur.execute("UPDATE citas SET estado = 'pagado' WHERE user_id = %s AND estado = 'pendiente'", (pago_a_confirmar['user_id'],))
                     conn.commit()
-                    enviar_meta(str(pago['user_id']), f"✅ *¡Pago en Bs. Confirmado!* Tu pizza ya está en el horno. 🍕")
-                    enviar_meta(ADMIN_PHONE, f"👌 Confirmado el pago de {pago['nombre']} (Ref: {pago['referencia']}).")
+                    enviar_meta(str(pago_a_confirmar['user_id']), f"✅ *¡Pago Confirmado!* Tu pizza ya está en el horno. 🍕")
+                    enviar_meta(ADMIN_PHONE, f"👌 Hecho. Pago de {pago_a_confirmar['nombre']} verificado.")
+
                 elif "[BOT:OFF]" in res_admin:
                     cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'"); conn.commit()
                     enviar_meta(numero, "😴 Bot desactivado.")
                 elif "[BOT:ON]" in res_admin:
                     cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'"); conn.commit()
-                    enviar_meta(numero, "🤖 Bot reactivado.")
+                    enviar_meta(numero, "🤖 Bot encendido.")
                 
-                # Cierre inmediato para evitar el bucle
                 cur.close(); conn.close()
-                return jsonify({"status": "admin_ok"}), 200
-
+                return jsonify({"status": "admin_processed"}), 200
+            
             # --- 🍕 LÓGICA DE CLIENTE ---
             cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
             if cur.fetchone()['value'] == 'false': return jsonify({"status": "off"}), 200
