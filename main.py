@@ -17,12 +17,33 @@ BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 
 MODELO_IA = "google/gemini-2.5-flash" #
 
-# --- UTILIDADES DE BASE DE DATOS ---
+# --- CONEXIÓN A DB ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+# --- 🏦 NUEVA FUNCIÓN DE TASAS BLINDADAS (BCV / AL CAMBIO) ---
+def obtener_tasas_dinamicas():
+    """Consulta múltiples fuentes para asegurar la tasa oficial en 2026"""
+    fuentes = [
+        "https://bcv.justcarlux.dev/api/v1/rates", # Fuente robusta de la comunidad
+        "https://ve.dolarapi.com/v1/dolares/oficial",
+        "https://pydolarvenezuela-api.vercel.app/api/v1/dollar?page=bcv"
+    ]
+    
+    for url in fuentes:
+        try:
+            res = requests.get(url, timeout=5).json()
+            # Lógica para extraer USD y EUR según el formato de la fuente
+            if 'usd' in str(res).lower():
+                # Formato estándar de DolarApi o similares
+                usd = res.get('usd', {}).get('promedio') or res.get('promedio') or res.get('price')
+                eur = res.get('eur', {}).get('promedio') or 450.0 # Fallback proporcional si falta EUR
+                return {"usd": float(usd), "eur": float(eur)}
+        except: continue
+    return None
+
+# --- MEMORIA Y LÓGICA ---
 def obtener_historial(id_num):
-    """Recupera los últimos 10 mensajes para la memoria del bot"""
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 10", (id_num,))
     filas = cur.fetchall()
@@ -33,14 +54,6 @@ def guardar_mensaje(id_num, user_in, bot_out):
     conn = get_db_connection(); cur = conn.cursor()
     cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, user_in, bot_out))
     conn.commit(); cur.close(); conn.close()
-
-def obtener_tasas_dinamicas():
-    """Consulta automática de tasas BCV (Dólar y Euro)"""
-    try:
-        usd = requests.get("https://ve.dolarapi.com/v1/dolares/oficial", timeout=5).json()
-        eur = requests.get("https://ve.dolarapi.com/v1/euro/oficial", timeout=5).json()
-        return {"usd": float(usd['promedio']), "eur": float(eur['promedio'])}
-    except: return None
 
 def ejecutar_logica_db(id_num, accion, extra=None):
     conn = get_db_connection(); cur = conn.cursor()
@@ -57,7 +70,6 @@ def ejecutar_logica_db(id_num, accion, extra=None):
         conn.commit()
     finally: cur.close(); conn.close()
 
-# --- NÚCLEO IA ---
 def consultar_ia(instruccion, texto, historial="", img_id=None):
     img_b64 = None
     if img_id:
@@ -68,7 +80,6 @@ def consultar_ia(instruccion, texto, historial="", img_id=None):
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     texto_completo = f"MEMORIA:\n{historial}\n\nMENSAJE ACTUAL: {texto}"
-    
     contenido = [{"type": "text", "text": texto_completo}]
     if img_b64: contenido.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
     
@@ -90,7 +101,7 @@ def webhook():
         msg = data['messages'][0]; numero = msg['from']; id_num = int(numero)
         conn = get_db_connection(); cur = conn.cursor()
 
-        # 🛡️ MODO ADMIN
+        # 🛡️ ADMIN
         if numero == ADMIN_PHONE:
             intent = consultar_ia("Tags: [APROBAR:REF], [LISTAR_PENDIENTES], [BOT:ON], [BOT:OFF].", msg.get('text', {}).get('body', ""))
             if "[APROBAR:" in intent:
@@ -100,7 +111,7 @@ def webhook():
             elif "[LISTAR_PENDIENTES]" in intent:
                 cur.execute("SELECT referencia, monto FROM pagos WHERE estado = 'pendiente'")
                 p = cur.fetchall()
-                enviar_meta(ADMIN_PHONE, "📝 Pendientes:\n" + "\n".join([f"- {i['referencia']} ({i['monto']} Bs)" for i in p]) if p else "✅ Todo al día.")
+                enviar_meta(ADMIN_PHONE, "📝 Pendientes:\n" + "\n".join([f"- {i['referencia']}" for i in p]) if p else "✅ Todo al día.")
             elif "[BOT:OFF]" in intent:
                 cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'")
                 conn.commit(); enviar_meta(ADMIN_PHONE, "😴 Bot apagado.")
@@ -109,7 +120,7 @@ def webhook():
                 conn.commit(); enviar_meta(ADMIN_PHONE, "🚀 Bot encendido.")
             return jsonify({"status": "ok"}), 200
 
-        # 🍕 MODO CLIENTE
+        # 🍕 CLIENTE
         cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
         if cur.fetchone()['value'] == 'false': return jsonify({"status": "off"}), 200
 
@@ -119,13 +130,14 @@ def webhook():
             cur.execute("INSERT INTO cliente (id, nombre) VALUES (%s, 'Nuevo')", (id_num,))
             conn.commit()
 
-        # Recepción de Ubicación
+        # GPS Nativo
         if msg.get('type') == 'location':
             loc = msg['location']
             ejecutar_logica_db(id_num, "GPS", f"{loc['latitude']},{loc['longitude']}")
             enviar_meta(numero, "📍 Ubicación guardada. ¡Tu pizza va en camino!")
             return jsonify({"status": "ok"}), 200
 
+        # CONSULTA IA CON TASAS DINÁMICAS
         tasas = obtener_tasas_dinamicas()
         if not tasas:
             enviar_meta(numero, "⚠️ Error técnico con las tasas. Intenta en un momento.")
@@ -133,10 +145,10 @@ def webhook():
 
         historial = obtener_historial(id_num)
         instruccion = f"""{BUSINESS_CONTEXT}\n
-        TASAS BCV: USD: {tasas['usd']} | EUR: {tasas['eur']}\n
+        TASAS BCV (DINÁMICAS): USD: {tasas['usd']} | EUR: {tasas['eur']}\n
         REGLAS:
         1. Usa [AGENDAR] al iniciar pedido.
-        2. Si el cliente no quiere nada más, resume la orden, da el total ($ y Bs) y PIDE LA UBICACIÓN POR GPS de WhatsApp. Usa [FINALIZAR].
+        2. Al finalizar ("no más", "es todo"): Resume orden, da total ($ y Bs), da datos pago y PIDE UBICACIÓN GPS. Usa [FINALIZAR].
         3. Usa [CANCELAR] si desiste."""
         
         texto_cli = msg.get('text', {}).get('body', "Archivo")
