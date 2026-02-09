@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 venezuela_tz = pytz.timezone('America/Caracas')
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN DE ENTORNO ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") 
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
@@ -16,15 +16,15 @@ ADMIN_PHONE = os.environ.get("ADMIN_PHONE")
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 MODELO_IA = "google/gemini-2.5-flash"
 
-# 🧠 MEMORIA TEMPORAL PARA DELAY (DEBOUNCE)
-user_buffers = {} # {id_num: {"text": "", "timer": TimerObject, "name": ""}}
+# 🧠 BUFFER PARA DELAY (DEBOUNCING)
+user_buffers = {} # {id_num: {"text": "", "timer": Timer}}
 
-# --- UTILIDADES ---
+# --- UTILIDADES DE BASE DE DATOS ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def obtener_tasas_dinamicas():
-    """Consulta fuentes y usa respaldo en DB"""
+    """Consulta APIs de tasas con respaldo en DB"""
     fuentes = ["https://ve.dolarapi.com/v1/dolares/oficial", "https://api.exchangerate-api.com/v4/latest/USD"]
     conn = get_db_connection(); cur = conn.cursor()
     t_usd = None
@@ -32,7 +32,7 @@ def obtener_tasas_dinamicas():
         try:
             res = requests.get(url, timeout=5).json()
             t_usd = float(res.get('promedio') or res['rates']['VES'])
-            if t_usd > 300:
+            if t_usd > 300: #
                 cur.execute("UPDATE config SET value = %s WHERE key = 'last_tasa'", (str(t_usd),))
                 conn.commit(); break
         except: continue
@@ -42,8 +42,9 @@ def obtener_tasas_dinamicas():
     cur.close(); conn.close()
     return {"usd": t_usd}
 
+# --- NÚCLEO IA Y MENSAJERÍA ---
 def consultar_ia(instruccion, texto, historial="", img_id=None):
-    """Cerebro Gemini con visión reforzada"""
+    """Cerebro Gemini para texto y visión reforzada"""
     img_b64 = None
     if img_id:
         res = requests.get(f"https://graph.facebook.com/v18.0/{img_id}", headers={"Authorization": f"Bearer {META_TOKEN}"})
@@ -70,73 +71,115 @@ def enviar_meta(to, text):
     headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}})
 
-# --- ⚙️ LÓGICA DE PROCESAMIENTO DIFERIDO (EL MOTOR DEL DELAY) ---
-def procesar_respuesta_acumulada(id_num, num, name):
-    """Se ejecuta solo cuando el cliente deja de escribir"""
-    time.sleep(1) # Pequeño margen de seguridad
+# --- ⚙️ PROCESAMIENTO DIFERIDO (LOGICA CLIENTE) ---
+def procesar_flujo_cliente(id_num, num, name):
+    """Agrupa mensajes y procesa tras 7 seg de silencio"""
+    time.sleep(1)
     conn = get_db_connection(); cur = conn.cursor()
-    
-    # 1. Recuperar lo acumulado y limpiar buffer
     buffer = user_buffers.get(id_num, {})
-    texto_final = buffer.get("text", "").strip()
-    if not texto_final: return
-    
-    del user_buffers[id_num] # Limpiar para el siguiente bloque de mensajes
+    texto_acumulado = buffer.get("text", "").strip()
+    if not texto_acumulado: return
+    del user_buffers[id_num]
 
-    # 2. Lógica de Tasas y Memoria
     t = obtener_tasas_dinamicas()
     cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 10", (id_num,))
     hist = "".join([f"U: {f['user_input']}\nB: {f['bot_response']}\n" for f in reversed(cur.fetchall())])
     
-    instr = f"""{BUSINESS_CONTEXT}\nTasa: {t['usd']} Bs.\nREGLAS: [AGENDAR] al iniciar, [FINALIZAR] al cerrar con resumen y GPS, [CANCELAR] para anular."""
+    instr = f"""{BUSINESS_CONTEXT}\nTasa: {t['usd']} Bs.\n
+    REGLAS:
+    1. Usa [AGENDAR] al iniciar un pedido.
+    2. Usa [FINALIZAR] al cerrar (da total $ y Bs, pide GPS).
+    3. Usa [CANCELAR] si el cliente desiste.
+    4. SI EL CLIENTE ESCRIBE UNA DIRECCIÓN, usa [DIRECCION: texto de la dirección]."""
     
-    # 3. Consultar IA
-    res_ia = consultar_ia(instr, texto_final, hist)
+    res_ia = consultar_ia(instr, texto_acumulado, hist)
 
-    # 4. Etiquetas de DB
+    # Ejecución de etiquetas en DB
+    if "[DIRECCION:" in res_ia:
+        dir_text = res_ia.split("[DIRECCION:")[1].split("]")[0].strip()
+        cur.execute("UPDATE pedidos SET direccion = %s WHERE user_id = %s AND estado IN ('confirmando','esperando_pago')", (dir_text, id_num))
     if "[AGENDAR]" in res_ia: cur.execute("INSERT INTO pedidos (user_id, estado) VALUES (%s, 'confirmando')", (id_num,))
     if "[FINALIZAR]" in res_ia: cur.execute("UPDATE pedidos SET estado = 'esperando_pago' WHERE user_id = %s AND estado = 'confirmando'", (id_num,))
-    if "[CANCELAR]" in res_ia: cur.execute("UPDATE pedidos SET estado = 'cancelado' WHERE user_id = %s", (id_num,))
+    if "[CANCELAR]" in res_ia: cur.execute("UPDATE pedidos SET estado = 'cancelado' WHERE user_id = %s AND estado IN ('confirmando','esperando_pago')", (id_num,))
+    
     conn.commit()
-
-    # 5. Enviar respuesta limpia
     limpia = res_ia.replace("[AGENDAR]","").replace("[FINALIZAR]","").replace("[CANCELAR]","")
+    if "[DIRECCION:" in limpia: limpia = limpia.split("[DIRECCION:")[0]
+    
     enviar_meta(num, limpia)
-    cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto_final, limpia))
+    cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto_acumulado, limpia))
     conn.commit(); cur.close(); conn.close()
 
-# --- WEBHOOK ---
+# --- WEBHOOK PRINCIPAL ---
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET': return request.args.get("hub.challenge"), 200
     
     body = request.json
-    data = body['entry'][0]['changes'][0]['value']
-    if 'messages' in data:
-        msg = data['messages'][0]; num = msg['from']; id_num = int(num)
-        name = body['entry'][0]['changes'][0]['value'].get('contacts', [{}])[0].get('profile', {}).get('name', 'Cliente')
-        
-        # 🛡️ EXCEPCIÓN: Imágenes, Ubicación y Admin se procesan al instante
-        if msg.get('type') in ['image', 'location'] or str(num) == str(ADMIN_PHONE):
-            # (Aquí va la lógica de pagos/gps/admin que ya tienes, procesada inmediatamente)
-            # Para brevedad, el código sigue procesando texto con delay
-            pass
+    if 'entry' in body:
+        data = body['entry'][0]['changes'][0]['value']
+        if 'messages' in data:
+            msg = data['messages'][0]; num = msg['from']; id_num = int(num)
+            name = body['entry'][0]['changes'][0]['value'].get('contacts', [{}])[0].get('profile', {}).get('name', 'Cliente')
+            conn = get_db_connection(); cur = conn.cursor()
 
-        # ⏳ LÓGICA DE DELAY PARA TEXTO
-        if msg.get('type') == 'text':
-            texto_nuevo = msg['text']['body']
-            
-            # Si el usuario ya tiene un buffer, cancelamos el timer anterior y sumamos el texto
-            if id_num in user_buffers:
-                user_buffers[id_num]["timer"].cancel()
-                user_buffers[id_num]["text"] += f" {texto_nuevo}"
-            else:
-                user_buffers[id_num] = {"text": texto_nuevo, "name": name}
+            # 🛡️ MODO ADMIN REFORZADO
+            num_lim = str(num).replace("+", "").strip()
+            adm_lim = str(ADMIN_PHONE).replace("+", "").strip()
+            if num_lim == adm_lim:
+                res_adm = consultar_ia("ADMIN: [BOT:ON], [BOT:OFF], [CONSULTAR_TASA], [LISTAR_PENDIENTES], [APROBAR:REF].", msg.get('text', {}).get('body', ""))
+                if "[BOT:OFF]" in res_adm: cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'")
+                elif "[BOT:ON]" in res_adm: cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'")
+                elif "[CONSULTAR_TASA]" in res_adm: 
+                    t = obtener_tasas_dinamicas(); enviar_meta(num, f"📊 Tasa Actual: {t['usd']} Bs/$")
+                elif "[APROBAR:" in res_adm:
+                    ref = res_adm.split(":")[1].replace("]", "").strip()
+                    cur.execute("UPDATE pagos SET estado = 'aprobado' WHERE referencia = %s", (ref,))
+                conn.commit(); enviar_meta(num, "✅ Comando Admin ejecutado."); return jsonify({"status": "ok"}), 200
 
-            # Creamos un nuevo timer de 7 segundos
-            nuevo_timer = threading.Timer(7.0, procesar_respuesta_acumulada, args=[id_num, num, name])
-            user_buffers[id_num]["timer"] = nuevo_timer
-            nuevo_timer.start()
+            # 🍕 MODO CLIENTE: Verificar si bot está encendido
+            cur.execute("SELECT value FROM config WHERE key = 'bot_active'")
+            if cur.fetchone()['value'] == 'false': return jsonify({"status": "off"}), 200
+
+            # Auto-registro de Cliente
+            cur.execute("SELECT id FROM cliente WHERE id = %s", (id_num,))
+            if not cur.fetchone():
+                cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, %s, %s)", (id_num, name, str(num)))
+                conn.commit()
+
+            # 📍 UBICACIÓN GPS
+            if msg.get('type') == 'location':
+                loc = f"{msg['location']['latitude']},{msg['location']['longitude']}"
+                cur.execute("UPDATE pedidos SET gps = %s WHERE user_id = %s AND estado IN ('confirmando','esperando_pago')", (loc, id_num))
+                conn.commit(); enviar_meta(num, "📍 Ubicación GPS guardada."); return jsonify({"status": "ok"}), 200
+
+            # 📸 PAGOS Y ANTIFRAUDE
+            if msg.get('type') == 'image':
+                res_v = consultar_ia('JSON: {"ref": "text", "monto": float}', "Pago", "", msg['image']['id'])
+                try:
+                    p = json.loads(res_v.replace("```json","").replace("```","").strip())
+                    cur.execute("SELECT id FROM pagos WHERE referencia = %s", (str(p['ref']),))
+                    if cur.fetchone(): enviar_meta(num, "❌ Referencia duplicada detectada.")
+                    else:
+                        cur.execute("INSERT INTO pagos (user_id, referencia, monto) VALUES (%s, %s, %s)", (id_num, str(p['ref']), p['monto']))
+                        conn.commit()
+                        cur.execute("SELECT SUM(monto) as tot FROM pagos WHERE user_id = %s", (id_num,))
+                        enviar_meta(num, f"✅ Recibido {p['monto']} Bs. Acumulado: {cur.fetchone()['tot']} Bs.")
+                        enviar_meta(ADMIN_PHONE, f"🚨 PAGO: {name} - Ref {p['ref']}")
+                except: enviar_meta(num, "⚠️ Error procesando el pago.")
+                return jsonify({"status": "ok"}), 200
+
+            # ⏳ DEBOUNCING (Delay de 7 seg)
+            if msg.get('type') == 'text':
+                txt = msg['text']['body']
+                if id_num in user_buffers:
+                    user_buffers[id_num]["timer"].cancel()
+                    user_buffers[id_num]["text"] += f" {txt}"
+                else: user_buffers[id_num] = {"text": txt}
+                
+                t_obj = threading.Timer(7.0, procesar_flujo_cliente, args=[id_num, num, name])
+                user_buffers[id_num]["timer"] = t_obj
+                t_obj.start()
 
     return jsonify({"status": "ok"}), 200
 
