@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 venezuela_tz = pytz.timezone('America/Caracas')
 
-# --- CONFIGURACIÓN DE VARIABLES DE ENTORNO ---
+# --- CONFIGURACIÓN DE INFRAESTRUCTURA ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") 
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
@@ -18,19 +18,19 @@ BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 # Motor exclusivo: Gemini 2.5 Flash
 MODELO_IA = "google/gemini-2.5-flash" 
 
-# --- CONEXIÓN A BASE DE DATOS ---
+# --- CONEXIÓN Y UTILIDADES ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# --- TASAS BCV AUTOMÁTICAS ---
 def obtener_tasas_bcv():
+    """Consulta automática de tasas oficiales del BCV"""
     try:
         usd = requests.get("https://ve.dolarapi.com/v1/dolares/oficial", timeout=5).json()
-        return {"usd": float(usd['promedio']), "eur": 65.0} # EUR estimado
+        return {"usd": float(usd['promedio']), "eur": 65.0}
     except: return {"usd": 55.0, "eur": 60.0}
 
-# --- LÓGICA DE ESCRITURA EN DB (NEON) ---
 def ejecutar_logica_db(id_num, accion, extra=None):
+    """Maneja las escrituras en las tablas de Pedidos y Citas"""
     conn = get_db_connection(); cur = conn.cursor()
     try:
         if accion == "AGENDAR":
@@ -73,16 +73,30 @@ def webhook():
         msg = data['messages'][0]; numero = msg['from']; id_num = int(numero)
         conn = get_db_connection(); cur = conn.cursor()
 
-        # 🛡️ LÓGICA DE ADMIN (LENGUAJE NATURAL)
+        # 🛡️ LÓGICA DE ADMIN (AUDITORÍA Y CONTROL)
         if numero == ADMIN_PHONE:
-            intent = consultar_ia("Detecta: [APROBAR:REF], [BOT:ON], [BOT:OFF].", msg.get('text', {}).get('body', ""))
+            texto_admin = msg.get('text', {}).get('body', "")
+            instr_admin = "Detecta intención: [APROBAR:REF], [LISTAR_PENDIENTES], [BOT:ON], [BOT:OFF]."
+            intent = consultar_ia(instr_admin, texto_admin)
+
             if "[APROBAR:" in intent:
                 ref = intent.split(":")[1].replace("]", "").strip()
                 cur.execute("UPDATE pagos SET estado = 'aprobado' WHERE referencia = %s", (ref,))
-                conn.commit(); enviar_meta(ADMIN_PHONE, f"✅ Ref {ref} aprobada.")
+                conn.commit(); enviar_meta(ADMIN_PHONE, f"✅ Pago {ref} aprobado con éxito.")
+            
+            elif "[LISTAR_PENDIENTES]" in intent:
+                cur.execute("SELECT referencia, monto FROM pagos WHERE estado = 'pendiente' LIMIT 10")
+                pendientes = cur.fetchall()
+                if pendientes:
+                    msg_p = "📝 *PAGOS PENDIENTES:* \n" + "\n".join([f"- Ref: {p['referencia']} ({p['monto']} Bs)" for p in pendientes])
+                else:
+                    msg_p = "✅ *Jefe, no hay pagos pendientes por aprobar.*"
+                enviar_meta(ADMIN_PHONE, msg_p)
+
             elif "[BOT:OFF]" in intent:
                 cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'")
-                conn.commit(); enviar_meta(ADMIN_PHONE, "😴 Bot desactivado.")
+                conn.commit(); enviar_meta(ADMIN_PHONE, "😴 Bot apagado. Estás al mando manual.")
+            
             return jsonify({"status": "ok"}), 200
 
         # 🍕 LÓGICA DE CLIENTE
@@ -96,14 +110,13 @@ def webhook():
             conn.commit()
 
         tasas = obtener_tasas_bcv()
-        instruccion = f"{BUSINESS_CONTEXT}\nTasa: {tasas['usd']} Bs.\nEtiquetas: [AGENDAR], [CANCELAR], [PAGO:ref]."
+        instruccion = f"{BUSINESS_CONTEXT}\nTasa: {tasas['usd']} Bs.\nUsa etiquetas: [AGENDAR], [CANCELAR], [PAGO:ref]."
         
         texto_cli = msg.get('text', {}).get('body', "Archivo")
         img_id = msg.get('image', {}).get('id') if msg.get('type') == 'image' else None
         
         respuesta_ia = consultar_ia(instruccion, texto_cli, img_id)
 
-        # Acciones automáticas en DB
         if "[AGENDAR]" in respuesta_ia: ejecutar_logica_db(id_num, "AGENDAR")
         if "[CANCELAR]" in respuesta_ia: ejecutar_logica_db(id_num, "CANCELAR")
         
