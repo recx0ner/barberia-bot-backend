@@ -87,15 +87,16 @@ def webhook():
             elif "[LISTAR_PENDIENTES]" in intent:
                 cur.execute("SELECT referencia, monto FROM pagos WHERE estado = 'pendiente' LIMIT 10")
                 pendientes = cur.fetchall()
-                if pendientes:
-                    msg_p = "📝 *PAGOS PENDIENTES:* \n" + "\n".join([f"- Ref: {p['referencia']} ({p['monto']} Bs)" for p in pendientes])
-                else:
-                    msg_p = "✅ *Jefe, no hay pagos pendientes por aprobar.*"
+                msg_p = "📝 *PAGOS PENDIENTES:* \n" + "\n".join([f"- Ref: {p['referencia']} ({p['monto']} Bs)" for p in pendientes]) if pendientes else "✅ Todo al día."
                 enviar_meta(ADMIN_PHONE, msg_p)
 
             elif "[BOT:OFF]" in intent:
                 cur.execute("UPDATE config SET value = 'false' WHERE key = 'bot_active'")
                 conn.commit(); enviar_meta(ADMIN_PHONE, "😴 Bot apagado. Estás al mando manual.")
+
+            elif "[BOT:ON]" in intent:
+                cur.execute("UPDATE config SET value = 'true' WHERE key = 'bot_active'")
+                conn.commit(); enviar_meta(ADMIN_PHONE, "🚀 Bot encendido. La IA vuelve a gestionar el chat.")
             
             return jsonify({"status": "ok"}), 200
 
