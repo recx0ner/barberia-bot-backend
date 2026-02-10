@@ -23,14 +23,13 @@ def cargar_configuracion():
     return config
 
 CONFIG = cargar_configuracion()
-# Limpieza preventiva del número admin
 ADMIN_PHONE_CLEAN = str(CONFIG["ADMIN_PHONE"]).replace("+", "").replace(" ", "").strip() if CONFIG["ADMIN_PHONE"] else ""
 MODELO_IA = "google/gemini-2.5-flash"
 
 user_buffers = {}
 cache_tasas = {"usd": 0.0, "eur": 0.0, "expira": 0}
 
-# --- CONEXIÓN DB ---
+# --- DB ---
 def get_db():
     try: return psycopg2.connect(CONFIG["DATABASE_URL"], cursor_factory=RealDictCursor)
     except Exception as e: print(f"❌ Error DB: {e}"); return None
@@ -101,13 +100,13 @@ def procesar_pago(image_id, cliente_id):
         datos = json.loads(content)
 
         if "error" in datos:
-            enviar_whatsapp(cliente_id, "⚠️ No pude leer el comprobante. Por favor escribe la referencia.")
+            enviar_whatsapp(cliente_id, "⚠️ No pude leer el comprobante.")
             return
 
         conn = get_db(); cur = conn.cursor()
         cur.execute("SELECT id FROM pagos WHERE referencia = %s", (str(datos['ref']),))
         if cur.fetchone():
-            enviar_whatsapp(cliente_id, f"❌ ERROR: La referencia {datos['ref']} ya fue usada.")
+            enviar_whatsapp(cliente_id, f"❌ ERROR: Referencia {datos['ref']} DUPLICADA.")
             conn.close(); return
 
         cur.execute("INSERT INTO pagos (cliente_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (cliente_id, str(datos['ref']), datos['monto']))
@@ -132,7 +131,7 @@ def consultar_ia(prompt, entrada):
         return res.json()['choices'][0]['message']['content']
     except: return "Error técnico IA."
 
-# --- PROCESAMIENTO CLIENTE ---
+# --- CLIENTE ---
 def procesar_cliente(telefono, nombre_wa, mensaje):
     conn = get_db(); cur = conn.cursor()
     
@@ -150,30 +149,29 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     
     historial_chat = obtener_historial(telefono)
 
+    # 🔥 PROMPT CORREGIDO: MÁS AGRESIVO CON LA ETIQUETA
     prompt = f"""
     CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
-    TASAS HOY: USD={tasas['usd']} Bs | EUR={tasas['eur']} Bs.
+    TASAS: USD={tasas['usd']} Bs.
     
-    REGLA DE ORO DE PRECIOS:
-    - SIEMPRE que des un precio en $, calcula y escribe al lado el monto en Bolívares (Bs).
-    - Ejemplo: "$10 ({10 * tasas['usd']} Bs)".
+    REGLA DE PRECIOS: Si mencionas $, pon al lado los Bs.
     
-    CLIENTE:
-    - Nombre: {nombre_real}
-    - Carrito: {carrito_txt}
-    - Historial: {historial_chat}
+    CLIENTE: {nombre_real}
+    CARRITO: {carrito_txt}
+    HISTORIAL: {historial_chat}
     
-    ACCIONES:
-    1. Nuevo -> [NOMBRE: ...]
-    2. Agrega -> [AGENDAR: Resumen | Monto USD]
-    3. Cancela -> [CANCELAR]
-    4. Dirección -> [DIRECCION: ...] (CONFIRMA verbalmente antes de usar la etiqueta).
+    ACCIONES OBLIGATORIAS:
+    1. Si es Nuevo -> [NOMBRE: ...]
+    2. Si pide -> [AGENDAR: Resumen | Monto USD]
+    3. Si cancela -> [CANCELAR]
+    4. SI ESCRIBE UNA DIRECCIÓN (aunque sea vaga) -> USA LA ETIQUETA [DIRECCION: ...] DE INMEDIATO. NO preguntes "¿es correcta?". ASUME que es la dirección y procésala.
     """
     
     resp_ia = consultar_ia(prompt, mensaje)
-    
-    # --- EJECUCIÓN DE ACCIONES ---
-    msg_to_user = "" # Mensaje forzado por código (Backup)
+    print(f"🤖 IA DICE: {resp_ia}") # 👈 DEBUG EN LOGS DE RENDER
+
+    # --- ACCIONES ---
+    msg_to_user = "" 
 
     if "[NOMBRE:" in resp_ia:
         n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
@@ -188,31 +186,26 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     if "[CANCELAR]" in resp_ia:
         cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
         
-    # 🔥 SOLUCIÓN AL SILENCIO: RESPUESTA FORZADA AL CONFIRMAR DIRECCIÓN
     if "[DIRECCION:" in resp_ia:
         d = resp_ia.split("[DIRECCION:")[1].split("]")[0].strip()
         cur.execute("UPDATE pedidos SET direccion=%s, estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (d, telefono))
         
-        # Calcular totales para el recibo
+        # CÁLCULO FINAL Y MENSAJE DE RECIBO
         monto_usd = pedido['monto_total'] if pedido else 0
         monto_bs = monto_usd * tasas['usd']
         
-        # Mensaje GARANTIZADO al usuario
-        msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📍 Dirección: {d}\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Métodos de Pago:*\n- Pago Móvil: 0414-1234567 (V-123456)\n- Zelle: correo@ejemplo.com\n\n📸 *Por favor envía captura de tu pago.*"
+        msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📍 Dirección: {d}\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Datos de Pago:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n\n📸 *Envía foto del pago para despachar.*"
         
-        # Aviso Admin (Protegido contra errores)
         if ADMIN_PHONE_CLEAN:
             try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO\nCliente: {nombre_real}\nDir: {d}\nTotal: {monto_bs:.2f} Bs")
-            except: print("Error avisando admin")
+            except: pass
 
     conn.commit(); conn.close()
     
-    # 1. Si hay mensaje forzado (Confirmación), enviamos ese
+    # RESPUESTA
     if msg_to_user:
         enviar_whatsapp(telefono, msg_to_user)
         guardar_mensaje(telefono, 'assistant', msg_to_user)
-        
-    # 2. Si no, enviamos lo que dijo la IA (limpiando tags)
     else:
         clean_resp = re.sub(r'\[.*?\]', '', resp_ia).strip()
         if clean_resp:
