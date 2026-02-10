@@ -30,31 +30,20 @@ MODELO_IA = "google/gemini-2.5-flash"
 user_buffers = {}
 cache_tasas = {"usd": 0.0, "eur": 0.0, "expira": 0}
 
-# --- ⚡ POOL DE CONEXIONES (VELOCIDAD EXTREMA) ---
+# --- POOL DB ---
 try:
-    pg_pool = psycopg2.pool.SimpleConnectionPool(
-        1, 20, # Min 1 conexión, Max 20 conexiones simultáneas
-        CONFIG["DATABASE_URL"],
-        cursor_factory=RealDictCursor
-    )
-    print("🚀 POOL DE BASE DE DATOS: INICIADO")
-except Exception as e:
-    print(f"❌ ERROR CRÍTICO AL INICIAR POOL: {e}")
-    pg_pool = None
+    pg_pool = psycopg2.pool.SimpleConnectionPool(1, 20, CONFIG["DATABASE_URL"], cursor_factory=RealDictCursor)
+except: pg_pool = None
 
 def get_db_connection():
-    try:
-        if pg_pool: return pg_pool.getconn()
-        else: return psycopg2.connect(CONFIG["DATABASE_URL"], cursor_factory=RealDictCursor) # Fallback
-    except Exception as e:
-        print(f"Error obteniendo conexión: {e}")
-        return None
+    try: return pg_pool.getconn() if pg_pool else psycopg2.connect(CONFIG["DATABASE_URL"], cursor_factory=RealDictCursor)
+    except: return None
 
 def release_db_connection(conn):
-    try:
-        if pg_pool and conn: pg_pool.putconn(conn)
-        elif conn: conn.close()
-    except Exception as e: print(f"Error liberando conexión: {e}")
+    try: 
+        if pg_pool: pg_pool.putconn(conn)
+        else: conn.close()
+    except: pass
 
 # --- WHATSAPP ---
 def enviar_whatsapp(to, body):
@@ -64,7 +53,7 @@ def enviar_whatsapp(to, body):
         requests.post(url, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}}, headers=headers, timeout=5)
     except Exception as e: print(f"Error WA: {e}")
 
-# --- MEMORIA (Optimizado) ---
+# --- MEMORIA ---
 def obtener_historial(conn, cliente_id):
     cur = conn.cursor()
     cur.execute("SELECT role, content FROM messages WHERE cliente_id = %s ORDER BY id DESC LIMIT 6", (cliente_id,))
@@ -91,7 +80,6 @@ def obtener_tasas():
     except: pass
     return cache_tasas
 
-# --- LIMPIEZA MONTO ---
 def limpiar_monto_bs(valor_raw):
     try:
         v = str(valor_raw).strip().replace("Bs.", "").replace("Bs", "").strip()
@@ -143,7 +131,6 @@ def procesar_pago(image_id, cliente_id):
         cur.execute("INSERT INTO pagos (cliente_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (cliente_id, ref_real, monto_real))
         conn.commit()
 
-        # Lógica Saldo
         tasas = obtener_tasas()
         cur.execute("SELECT monto_total FROM pedidos WHERE cliente_id = %s AND estado IN ('carrito', 'confirmado') LIMIT 1", (cliente_id,))
         pedido = cur.fetchone()
@@ -170,7 +157,7 @@ def procesar_pago(image_id, cliente_id):
             enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *PAGO NUEVO*\nRef: {ref_real}\nMonto: {monto_real:,.2f} Bs{msg_admin_extra}\nResponde 'Sí' para aprobar.")
 
     except Exception as e: print(f"Error Pago: {e}")
-    finally: release_db_connection(conn) # ⚠️ LIBERAR SIEMPRE
+    finally: release_db_connection(conn)
 
 # --- IA ---
 def consultar_ia(prompt, entrada):
@@ -188,12 +175,10 @@ def consultar_ia(prompt, entrada):
 
 # --- CLIENTE ---
 def procesar_cliente(telefono, nombre_wa, mensaje):
-    conn = get_db_connection() # ⚡ OBTENER DEL POOL
+    conn = get_db_connection()
     if not conn: return
-    
     try:
         cur = conn.cursor()
-        
         cur.execute("SELECT nombre FROM clientes WHERE telefono = %s", (telefono,))
         res = cur.fetchone()
         if not res:
@@ -206,27 +191,35 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         pedido = cur.fetchone()
         carrito_txt = f"Carrito: {pedido['resumen']} (${pedido['monto_total']})" if pedido else "Vacio"
         
-        historial_chat = obtener_historial(conn, telefono) # Usamos la misma conexión
+        historial_chat = obtener_historial(conn, telefono)
 
+        # 🔥 PROMPT "CIERRE DIRECTO"
         prompt = f"""
         CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
         TASAS: USD={tasas['usd']} Bs.
-        POLITICA: Retiro en Tienda UNICAMENTE.
-        REGLA PRECIOS: Si mencionas $, pon al lado los Bs.
         
         CLIENTE: {nombre_real}
         CARRITO: {carrito_txt}
         HISTORIAL: {historial_chat}
         
-        ACCIONES:
-        1. Nuevo -> [NOMBRE: nombre]
-        2. Agrega -> [AGENDAR: Resumen | Monto USD]
-        3. Cancela -> [CANCELAR]
-        4. Cierre -> [FINALIZAR]
+        INSTRUCCIONES DE COMPORTAMIENTO:
+        1. Si el cliente dice qué quiere (ej: "Una pepperoni"), DEBES usar la etiqueta [AGENDAR] en ese mismo mensaje. ¡NO ESPERES A CONFIRMAR!
+           Correcto: "¡Listo! Agendo tu Pepperoni por $10. [AGENDAR: Pizza Pepperoni | 10]"
+        
+        2. Si el cliente dice "SOLO ESO", "NADA MÁS", "LISTO", "OK", "SI":
+           -> USA LA ETIQUETA [FINALIZAR] DE INMEDIATO.
+           -> NO preguntes "¿Te confirmo?". Asume que ya confirmó y cierra la venta.
+        
+        ACCIONES TÉCNICAS:
+        - [NOMBRE: ...]
+        - [AGENDAR: Resumen | Monto USD]
+        - [CANCELAR]
+        - [FINALIZAR] (Para cerrar venta y mostrar recibo).
         """
         
         resp_ia = consultar_ia(prompt, mensaje)
         
+        # --- PROCESAR ETIQUETAS ---
         msg_to_user = "" 
 
         if "[NOMBRE:" in resp_ia:
@@ -236,22 +229,31 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         if "[AGENDAR:" in resp_ia:
             d = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
             resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
-            if pedido: cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
-            else: cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
-            
+            if pedido: 
+                cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
+                pedido = {'resumen': resum, 'monto_total': m} 
+            else: 
+                cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
+                pedido = {'resumen': resum, 'monto_total': m}
+        
         if "[CANCELAR]" in resp_ia:
             cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
             
         if "[FINALIZAR]" in resp_ia:
             cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
-            monto_usd = pedido['monto_total'] if pedido else 0
+            
+            monto_usd = float(pedido['monto_total']) if pedido else 0.0
+            resumen_final = pedido['resumen'] if pedido else "Varios"
             monto_bs = monto_usd * tasas['usd']
-            msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📝 Pedido: {pedido['resumen'] if pedido else 'Varios'}\n💵 Total: ${monto_usd:.2f} ({monto_bs:,.2f} Bs)\n\n📍 *Retiro en Tienda.*\n📲 *Pago Móvil:* 0412-1234567 | V-12345678 | Banco Venezuela"
+            
+            # Recibo Final Automático
+            msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📝 {resumen_final}\n💵 Total: ${monto_usd:.2f} ({monto_bs:,.2f} Bs)\n\n📍 *Retiro en Tienda.*\n📲 *Pago Móvil:* 0412-1234567 | V-12345678 | Banco Venezuela\n\n📸 *Envía el comprobante para apartar tu pedido.*"
+            
             if ADMIN_PHONE_CLEAN:
                 try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO\nCliente: {nombre_real}\nTotal: {monto_bs:,.2f} Bs")
                 except: pass
 
-        conn.commit() # Guardar cambios en DB
+        conn.commit()
         
         if msg_to_user:
             enviar_whatsapp(telefono, msg_to_user)
@@ -264,7 +266,7 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
                 guardar_mensaje(conn, telefono, 'assistant', clean_resp)
 
     except Exception as e: print(f"Error Cliente: {e}")
-    finally: release_db_connection(conn) # ⚡ LIBERAR CONEXIÓN (CRÍTICO)
+    finally: release_db_connection(conn)
 
 # --- WEBHOOK ---
 @app.route("/whatsapp", methods=["POST", "GET"])
@@ -277,7 +279,6 @@ def webhook():
         nombre = data['contacts'][0]['profile']['name']
 
         if num == ADMIN_PHONE_CLEAN:
-            # Lógica Admin (sin cambios, solo usando pool)
             if "activar" in txt and "prueba" in txt:
                 conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE config SET value='true' WHERE key='test_mode'"); conn.commit(); release_db_connection(conn)
                 enviar_whatsapp(num, "🧪 TEST ON"); return "OK", 200
@@ -306,6 +307,7 @@ def webhook():
         if (not res_bot or res_bot['value'] == 'false') and num != ADMIN_PHONE_CLEAN: return "OK", 200
 
         if msg['type'] == 'image': threading.Thread(target=procesar_pago, args=(msg['image']['id'], num)).start(); return "OK", 200
+        
         if msg['type'] == 'location': return "OK", 200 
 
         if num in user_buffers: user_buffers[num]['timer'].cancel(); user_buffers[num]['text'] += f" {txt}"
