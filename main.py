@@ -13,7 +13,6 @@ ADMIN_PHONE = str(os.environ.get("ADMIN_PHONE")).replace("+", "").strip()
 BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
 MODELO_IA = "google/gemini-2.5-flash"
 
-# Cache en memoria
 procesados = set() 
 user_buffers = {} 
 
@@ -26,21 +25,16 @@ def get_db_connection():
 
 def obtener_tasas_dinamicas():
     conn = get_db_connection()
-    tasas = {"usd": 385.50, "eur": 415.00} # Valores por defecto
+    tasas = {"usd": 385.50, "eur": 415.00}
     if not conn: return tasas
-    
     cur = conn.cursor()
     try:
-        # Intento de API
         r_usd = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=3).json()
         tasas['usd'] = float(r_usd['rates']['VES'])
         r_eur = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=3).json()
         tasas['eur'] = float(r_eur['rates']['VES'])
-    except:
-        # Fallback a DB si API falla
-        pass
-    finally: 
-        cur.close(); conn.close()
+    except: pass
+    finally: cur.close(); conn.close()
     return tasas
 
 def enviar_meta(to, text):
@@ -52,7 +46,7 @@ def enviar_meta(to, text):
     except Exception as e:
         print(f"⚠️ Error enviando a Meta: {e}")
 
-# 🛡️ FUNCIÓN IA BLINDADA (SOLUCIÓN KEYERROR)
+# 🛡️ IA BLINDADA
 def consultar_ia(instruccion, texto, historial="", img_id=None):
     try:
         img_b64 = None
@@ -63,8 +57,7 @@ def consultar_ia(instruccion, texto, historial="", img_id=None):
                 if img_url:
                     img_data = requests.get(img_url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=10).content
                     img_b64 = base64.b64encode(img_data).decode('utf-8')
-            except Exception as e:
-                print(f"⚠️ Error descargando imagen: {e}")
+            except: pass
 
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
@@ -74,63 +67,54 @@ def consultar_ia(instruccion, texto, historial="", img_id=None):
             "messages": [
                 {"role": "system", "content": instruccion},
                 {"role": "user", "content": [
-                    {"type": "text", "text": f"{historial}\n{texto}"},
+                    {"type": "text", "text": f"{historial}\nActual: {texto}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}} if img_b64 else None
                 ]}
             ],
             "temperature": 0.1
         }
-        # Limpiar contenido nulo (por si no hay imagen)
         payload["messages"][1]["content"] = [i for i in payload["messages"][1]["content"] if i]
 
         response = requests.post(url, headers=headers, json=payload, timeout=20)
         
         if response.status_code == 200:
             data = response.json()
-            if 'choices' in data and len(data['choices']) > 0:
-                return data['choices'][0]['message']['content']
-            else:
-                print(f"❌ API Respondió pero sin 'choices': {data}")
-                return "⚠️ Estoy teniendo un pequeño lapso de memoria. ¿Podrías repetirme eso?"
-        else:
-            print(f"🔥 Error API {response.status_code}: {response.text}")
-            return "⚠️ Error de conexión con mi cerebro digital."
+            if 'choices' in data: return data['choices'][0]['message']['content']
+        return "⚠️ Error de conexión."
 
     except Exception as e:
-        print(f"🔥 EXCEPCIÓN CRÍTICA EN IA: {e}")
-        return "⚠️ Error técnico interno."
+        print(f"🔥 Error IA: {e}")
+        return "⚠️ Error técnico."
 
-# --- 👑 LÓGICA ADMIN ---
+# --- ADMIN ---
 def ejecutar_comando_admin(msg_text, num):
     try:
         conn = get_db_connection()
         if not conn: return
         cur = conn.cursor()
         
-        prompt = "ADMIN: [BOT:ON], [BOT:OFF], [CONSULTAR_TASA], [MODO_PRUEBA:ON], [LISTAR_PENDIENTES]."
+        prompt = "ADMIN: [BOT:ON], [BOT:OFF], [CONSULTAR_TASA], [MODO_PRUEBA:ON]."
         intent = consultar_ia(prompt, msg_text)
         
         if "[MODO_PRUEBA:ON]" in intent:
             cur.execute("UPDATE config SET value = 'true' WHERE key = 'test_mode'")
-            enviar_meta(num, "🧪 *MODO PRUEBA ACTIVADO*")
+            enviar_meta(num, "🧪 MODO PRUEBA ON")
         elif "[CONSULTAR_TASA]" in intent:
             t = obtener_tasas_dinamicas()
-            enviar_meta(num, f"📊 Tasas: {t['usd']} Bs/$ | {t['eur']} Bs/€")
+            enviar_meta(num, f"📊 USD: {t['usd']} | EUR: {t['eur']}")
         else:
-            enviar_meta(num, "✅ Admin: Comando procesado.")
+            enviar_meta(num, "✅ Admin OK.")
         
         conn.commit(); cur.close(); conn.close()
-    except Exception as e:
-        print(f"Error Admin Thread: {e}")
+    except: pass
 
-# --- 🍕 LÓGICA CLIENTE ---
+# --- CLIENTE ---
 def procesar_flujo_cliente(id_num, num, name_wa, texto_extra=None):
     try:
         conn = get_db_connection()
         if not conn: return
         cur = conn.cursor()
 
-        # Consumir Buffer
         buffer = user_buffers.get(id_num, {"text": ""})
         texto_acum = (buffer.get("text", "") + " " + (texto_extra or "")).strip()
         if id_num in user_buffers: del user_buffers[id_num]
@@ -140,19 +124,29 @@ def procesar_flujo_cliente(id_num, num, name_wa, texto_extra=None):
 
         t = obtener_tasas_dinamicas()
         cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 6", (id_num,))
-        hist = "".join([f"U: {f['user_input']}\nB: {f['bot_response']}\n" for f in reversed(cur.fetchall())])
+        hist = "".join([f"Usuario: {f['user_input']}\nBot: {f['bot_response']}\n" for f in reversed(cur.fetchall())])
         
+        # PROMPT CORREGIDO: ETIQUETAS AL FINAL
         instr = f"""{BUSINESS_CONTEXT}\nTasa: {t['usd']} Bs.\n
-        REGLAS TÉCNICAS OBLIGATORIAS:
-        1. Si elige producto/sabor: usa [AGENDAR].
-        2. Si da dirección/GPS: usa [FINALIZAR].
-        3. Si escribe dirección: usa [DIRECCION: texto].
-        4. Si se presenta: usa [NOMBRE: texto].
+        REGLAS DE FORMATO (IMPORTANTE):
+        1. NO uses prefijos como "Bot:" o "B:". Responde directamente.
+        2. Escribe de forma natural. NO incluyas etiquetas dentro de las oraciones.
+        3. Pon las etiquetas TÉCNICAS SIEMPRE AL FINAL del mensaje, en una línea separada.
+        
+        ETIQUETAS DISPONIBLES:
+        - [NOMBRE: nombre detectado]
+        - [AGENDAR] (si pide producto)
+        - [FINALIZAR] (si da dirección/GPS -> da el total y pago móvil)
+        - [DIRECCION: dirección detectada]
+        - [CANCELAR]
         """
         
         res_ia = consultar_ia(instr, texto_acum, hist)
 
-        # ⚙️ PROCESAMIENTO ETIQUETAS
+        # Limpieza de prefijos alucinados (Solución a image_1fc7d0)
+        res_ia = res_ia.replace("Bot:", "").replace("B:", "").strip()
+
+        # Procesar etiquetas
         if "[NOMBRE:" in res_ia:
             try:
                 n = res_ia.split("[NOMBRE:")[1].split("]")[0].strip()
@@ -174,7 +168,7 @@ def procesar_flujo_cliente(id_num, num, name_wa, texto_extra=None):
 
         conn.commit()
 
-        # 🧹 LIMPIEZA TOTAL DE ETIQUETAS (SOLUCIÓN A TU FOTO)
+        # Limpiar etiquetas del mensaje final al cliente
         limpia = re.sub(r'\[.*?\]', '', res_ia).strip()
         
         if limpia:
@@ -185,8 +179,7 @@ def procesar_flujo_cliente(id_num, num, name_wa, texto_extra=None):
         cur.close(); conn.close()
 
     except Exception as e:
-        print(f"🔥 Error Flujo Cliente: {e}")
-        enviar_meta(num, "⚠️ Ocurrió un error procesando tu mensaje. Intenta de nuevo.")
+        print(f"🔥 Error Flujo: {e}")
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
@@ -200,27 +193,21 @@ def webhook():
         
         if 'messages' in value:
             msg = value['messages'][0]
-            num = msg['from']
-            id_num = int(num)
-            msg_id = msg.get('id')
+            num = msg['from']; id_num = int(num); msg_id = msg.get('id')
 
-            # Anti-duplicados
             if msg_id in procesados: return jsonify({"status": "ok"}), 200
             procesados.add(msg_id)
 
             conn = get_db_connection()
-            if not conn: return jsonify({"status": "error_db"}), 200
+            if not conn: return jsonify({"status": "ok"}), 200
             cur = conn.cursor()
             
-            # Verificar Test Mode
             cur.execute("SELECT value FROM config WHERE key = 'test_mode'")
             row = cur.fetchone()
             test_mode = row['value'] == 'true' if row else False
-            
             num_lim = str(num).replace("+", "").strip()
             msg_body = msg.get('text', {}).get('body', "")
 
-            # 1. Salida de Emergencia
             if num_lim == ADMIN_PHONE and "[MODO_PRUEBA:OFF]" in msg_body:
                 cur.execute("UPDATE config SET value = 'false' WHERE key = 'test_mode'")
                 conn.commit(); cur.close(); conn.close()
@@ -229,36 +216,28 @@ def webhook():
 
             cur.close(); conn.close()
 
-            # 2. Rutas
             if num_lim == ADMIN_PHONE and not test_mode:
                 threading.Thread(target=ejecutar_comando_admin, args=(msg_body, num)).start()
             else:
-                # Cliente o Admin en Test
                 name_wa = value.get('contacts', [{}])[0].get('profile', {}).get('name', 'Cliente')
                 
                 if msg.get('type') == 'location':
-                    # Guardar GPS y forzar respuesta
-                    conn = get_db_connection(); cur = conn.cursor()
                     gps = f"{msg['location']['latitude']},{msg['location']['longitude']}"
+                    conn = get_db_connection(); cur = conn.cursor()
                     cur.execute("UPDATE pedidos SET gps = %s WHERE user_id = %s AND estado = 'confirmando'", (gps, id_num))
                     conn.commit(); cur.close(); conn.close()
-                    
                     threading.Thread(target=procesar_flujo_cliente, args=(id_num, num, name_wa, "He enviado mi GPS.")).start()
                 
                 elif msg.get('type') == 'text':
-                    # Debouncing 5s
                     if id_num in user_buffers:
                         user_buffers[id_num]["timer"].cancel()
                         user_buffers[id_num]["text"] += f" {msg_body}"
                     else:
                         user_buffers[id_num] = {"text": msg_body}
-                    
                     t = threading.Timer(5.0, procesar_flujo_cliente, args=[id_num, num, name_wa])
                     user_buffers[id_num]["timer"] = t; t.start()
 
-    except Exception as e:
-        print(f"🔥 Error Webhook General: {e}")
-
+    except Exception as e: print(f"🔥 Error: {e}")
     return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
