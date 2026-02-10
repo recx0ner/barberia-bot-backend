@@ -1,6 +1,7 @@
-import os, requests, psycopg2, base64, json, threading, time, re
+import os, requests, psycopg2, json, time, re, threading
+from flask import Flask, request
 from psycopg2.extras import RealDictCursor
-from flask import Flask, request, jsonify
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -9,195 +10,234 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") 
 META_TOKEN = os.environ.get("META_ACCESS_TOKEN")
 META_PHONE_ID = os.environ.get("META_PHONE_ID")
-ADMIN_PHONE = str(os.environ.get("ADMIN_PHONE")).replace("+", "").strip()
-BUSINESS_CONTEXT = os.environ.get("BUSINESS_CONTEXT")
+ADMIN_PHONE = str(os.environ.get("ADMIN_PHONE")).replace("+", "").replace(" ", "").strip()
+
+# ⚠️ MODELO CORREGIDO SEGÚN TU CONTEXTO PERSONAL
 MODELO_IA = "google/gemini-2.5-flash"
 
-procesados = set() 
-user_buffers = {} 
+# --- MEMORIA VOLÁTIL ---
+user_buffers = {}   # Buffer para el delay de 5s
+procesados = set()  # Anti-spam de Meta
+cache_tasas = {"usd": 0.0, "eur": 0.0, "expira": 0} # Cache de 1 hora
 
-def get_db_connection():
+# --- CONEXIÓN DB ---
+def get_db():
     try: return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    except: return None
+    except Exception as e: print(f"❌ Error DB: {e}"); return None
 
-def enviar_meta(to, text):
+# --- WHATSAPP SEND ---
+def enviar_whatsapp(to, body):
     try:
-        url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
+        url = f"https://graph.facebook.com/v17.0/{META_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-        requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}, timeout=10)
+        requests.post(url, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}}, headers=headers, timeout=5)
     except: pass
 
-# 👁️ SISTEMA DE VISIÓN (OCR DE PAGOS)
-def analizar_comprobante(img_id):
+# --- TASAS AUTOMÁTICAS (ExchangeRate-API) ---
+def obtener_tasas():
+    global cache_tasas
+    # Si el caché es válido (menos de 1 hora), úsalo
+    if time.time() < cache_tasas["expira"]: return cache_tasas
+
+    t_usd, t_eur = 0.0, 0.0
     try:
-        # Descargar imagen de Meta
-        url_get = f"https://graph.facebook.com/v18.0/{img_id}"
-        headers = {"Authorization": f"Bearer {META_TOKEN}"}
-        res_url = requests.get(url_get, headers=headers).json().get('url')
-        img_data = requests.get(res_url, headers=headers).content
-        img_b64 = base64.b64encode(img_data).decode('utf-8')
+        # Consultar API Externa
+        res_u = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=4).json()
+        t_usd = float(res_u['rates']['VES'])
+        
+        res_e = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=4).json()
+        t_eur = float(res_e['rates']['VES'])
+        
+        # Guardar respaldo en Neon
+        conn = get_db()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE config SET value=%s, updated_at=NOW() WHERE key='tasa_usd'", (str(t_usd),))
+            cur.execute("UPDATE config SET value=%s, updated_at=NOW() WHERE key='tasa_eur'", (str(t_eur),))
+            conn.commit(); conn.close()
+            print(f"🔄 Tasas Actualizadas API: ${t_usd} | €{t_eur}")
+    except:
+        # Fallback: Leer de Neon si la API falla
+        conn = get_db()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT key, value FROM config WHERE key IN ('tasa_usd','tasa_eur')")
+            rows = cur.fetchall()
+            for r in rows:
+                if r['key'] == 'tasa_usd': t_usd = float(r['value'])
+                if r['key'] == 'tasa_eur': t_eur = float(r['value'])
+            conn.close()
 
-        # Consultar a Gemini Vision
-        url_ai = "https://openrouter.ai/api/v1/chat/completions"
-        payload = {
-            "model": MODELO_IA,
-            "messages": [
-                {"role": "system", "content": "Eres un auditor financiero. Extrae la REFERENCIA (números) y el MONTO del comprobante bancario. Responde SOLO en JSON: {\"ref\": \"123456\", \"monto\": 100.50}. Si no es un pago, responde {\"error\": \"no_es_pago\"}."},
-                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
-            ]
-        }
-        res = requests.post(url_ai, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, json=payload).json()
-        content = res['choices'][0]['message']['content'].replace("```json", "").replace("```", "").strip()
-        return json.loads(content)
-    except Exception as e:
-        print(f"Error OCR: {e}")
-        return {"error": "falla_tecnica"}
+    # Actualizar caché (expira en 3600 seg = 1 hora)
+    cache_tasas = {"usd": t_usd, "eur": t_eur, "expira": time.time() + 3600}
+    return cache_tasas
 
-def consultar_ia(instruccion, texto, historial=""):
+# --- CEREBRO IA (Gemini 2.5 Flash) ---
+def consultar_ia(prompt_sistema, entrada):
     try:
         url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": MODELO_IA,
-            "messages": [{"role": "system", "content": instruccion}, {"role": "user", "content": f"{historial}\nActual: {texto}"}],
-            "temperature": 0.1
+            "messages": [{"role": "system", "content": prompt_sistema}, {"role": "user", "content": entrada}],
+            "temperature": 0.0
         }
-        res = requests.post(url, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, json=payload, timeout=15).json()
-        if 'choices' in res: return res['choices'][0]['message']['content']
-    except: pass
-    return "⚠️ Error de conexión."
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        if 'choices' in res.json():
+            return res.json()['choices'][0]['message']['content']
+        return "Error: Sin respuesta IA."
+    except: return "Error técnico en IA."
 
-# --- FLUJO CLIENTE ---
-def procesar_flujo_cliente(id_num, num, texto_entrada, es_imagen=False, img_id=None):
-    try:
-        conn = get_db_connection(); cur = conn.cursor()
-        
-        # Buffer de texto
-        if not es_imagen:
-            buffer = user_buffers.get(id_num, {"text": ""})
-            texto_acum = (buffer.get("text", "") + " " + texto_entrada).strip()
-            if id_num in user_buffers: del user_buffers[id_num]
-        else:
-            texto_acum = "[IMAGEN_ENVIADA]"
-
-        # 💰 LÓGICA DE PAGOS (Antifraude)
-        info_pago = ""
-        if es_imagen and img_id:
-            datos = analizar_comprobante(img_id)
-            if "ref" in datos:
-                # Verificar duplicado
-                cur.execute("SELECT id FROM pagos WHERE referencia = %s", (str(datos['ref']),))
-                if cur.fetchone():
-                    enviar_meta(num, f"❌ La referencia {datos['ref']} ya fue registrada antes.")
-                    return # Cortamos flujo aquí
-                else:
-                    # Registrar pago
-                    cur.execute("INSERT INTO pagos (user_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (id_num, str(datos['ref']), datos['monto']))
-                    conn.commit()
-                    info_pago = f"SISTEMA: El cliente envió comprobante Ref {datos['ref']} por {datos['monto']} Bs. CALCULA EL RESTANTE."
-            else:
-                info_pago = "SISTEMA: El cliente envió una imagen que NO parece un pago."
-
-        # Historial
-        cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 6", (id_num,))
-        hist = "".join([f"U: {f['user_input']}\nB: {f['bot_response']}\n" for f in reversed(cur.fetchall())])
-        
-        # Recuperar nombre actual
-        cur.execute("SELECT nombre FROM cliente WHERE id = %s", (id_num,))
-        cliente_db = cur.fetchone()
-        nombre_actual = cliente_db['nombre'] if cliente_db else "Por definir"
-
-        prompt = f"""{BUSINESS_CONTEXT}
-        Cliente: {nombre_actual}.
-        Nota del Sistema: {info_pago}
-        
-        REGLAS DE FLUJO:
-        1. Si el nombre es "Por definir" o "Cliente Nuevo", TU PRIORIDAD es preguntar su nombre. NO tomes pedido aún.
-        2. Cuando te diga su nombre, usa la etiqueta [NOMBRE: ...].
-        3. Si envía pago: Confirma recepción, resta el monto del total del pedido y dile cuánto le falta (o si está listo).
-        4. ETIQUETAS AL FINAL: [AGENDAR], [FINALIZAR], [CANCELAR], [DIRECCION:...].
-        5. [CANCELAR]: Úsalo si el cliente dice "cancela", "olvídalo" o "no quiero nada".
-        """
-
-        res_ia = consultar_ia(prompt, texto_acum, hist)
-
-        # Procesar Etiquetas
-        if "[NOMBRE:" in res_ia:
-            n = res_ia.split("[NOMBRE:")[1].split("]")[0].strip()
-            cur.execute("UPDATE cliente SET nombre = %s WHERE id = %s", (n, id_num))
-        
-        if "[CANCELAR]" in res_ia:
-            cur.execute("UPDATE pedidos SET estado = 'cancelado' WHERE user_id = %s AND estado IN ('confirmando','esperando_pago')", (id_num,))
-            res_ia = "Entendido, pedido cancelado. Avísame si deseas algo más." # Respuesta forzada limpia
-
-        if "[AGENDAR]" in res_ia:
-            cur.execute("INSERT INTO pedidos (user_id, estado) VALUES (%s, 'confirmando') ON CONFLICT DO NOTHING", (id_num,))
-
-        if "[FINALIZAR]" in res_ia: 
-            cur.execute("UPDATE pedidos SET estado = 'esperando_pago' WHERE user_id = %s AND estado = 'confirmando'", (id_num,))
-            enviar_meta(ADMIN_PHONE, f"🚨 PEDIDO CONFIRMADO: {nombre_actual}")
-
+# --- PROCESAMIENTO CENTRAL (CLIENTE) ---
+def procesar_cliente(telefono, nombre_wa, mensaje_acumulado):
+    conn = get_db(); cur = conn.cursor()
+    
+    # 1. Identificar Cliente
+    cur.execute("SELECT nombre FROM clientes WHERE telefono = %s", (telefono,))
+    res = cur.fetchone()
+    if not res:
+        cur.execute("INSERT INTO clientes (telefono, nombre) VALUES (%s, %s)", (telefono, nombre_wa))
         conn.commit()
+        nombre_real = "Nuevo"
+    else:
+        nombre_real = res['nombre']
+
+    # 2. Contexto (Carrito + Tasas)
+    tasas = obtener_tasas()
+    cur.execute("SELECT resumen, monto_total FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1", (telefono,))
+    pedido = cur.fetchone()
+    carrito_txt = f"Carrito: {pedido['resumen']} (${pedido['monto_total']})" if pedido else "Carrito Vacio"
+
+    prompt = f"""
+    Eres 'PizzaBros'. TASAS HOY: USD={tasas['usd']} Bs, EUR={tasas['eur']} Bs.
+    Cliente: {nombre_real}. {carrito_txt}.
+    Mensaje del cliente: "{mensaje_acumulado}"
+
+    REGLAS ESTRICTAS:
+    - Si el nombre es "Nuevo", PREGUNTA su nombre real. Acción: [NOMBRE: ...]
+    - Si pide algo: Responde y agéndalo. Acción: [AGENDAR: Resumen | Monto en USD]
+    - Si cancela: Acción: [CANCELAR]
+    - Si da dirección/GPS: Confirma total en Bs. Acción: [DIRECCION: ...]
+    - Si cierra venta: Acción: [FINALIZAR]
+    """
+    
+    resp_ia = consultar_ia(prompt, mensaje_acumulado)
+    
+    # 3. Ejecutar Acciones DB
+    if "[NOMBRE:" in resp_ia:
+        n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
+        cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
         
-        # Limpieza
-        limpia = re.sub(r'\[.*?\]', '', res_ia).replace("Bot:", "").strip()
-        if limpia:
-            enviar_meta(num, limpia)
-            cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto_acum, limpia))
-            conn.commit()
+    if "[AGENDAR:" in resp_ia:
+        data = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
+        resumen = data[0].strip()
+        monto = float(data[1].strip()) if len(data)>1 else 0
+        if pedido:
+            cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resumen, monto, telefono))
+        else:
+            cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resumen, monto))
             
-        cur.close(); conn.close()
+    if "[CANCELAR]" in resp_ia:
+        cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
+        
+    if "[DIRECCION:" in resp_ia:
+        d = resp_ia.split("[DIRECCION:")[1].split("]")[0].strip()
+        cur.execute("UPDATE pedidos SET direccion=%s, estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (d, telefono))
+        
+        # Notificar Admin (Conversión a Bs)
+        bs_total = (pedido['monto_total'] * tasas['usd']) if pedido else 0
+        enviar_whatsapp(ADMIN_PHONE, f"🚨 PEDIDO CONFIRMADO\nCliente: {nombre_real}\nDirección: {d}\nTotal: {bs_total:.2f} Bs (${pedido['monto_total']})")
 
-    except Exception as e: print(f"Error: {e}")
+    conn.commit(); conn.close()
+    
+    # 4. Responder al cliente (Limpiando tags)
+    texto_limpio = re.sub(r'\[.*?\]', '', resp_ia).strip()
+    if texto_limpio: enviar_whatsapp(telefono, texto_limpio)
 
-@app.route('/whatsapp', methods=['POST', 'GET'])
+# --- WEBHOOK ---
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method == 'GET': return request.args.get("hub.challenge"), 200
     try:
         data = request.json['entry'][0]['changes'][0]['value']
-        if 'messages' in data:
-            msg = data['messages'][0]; num = msg['from']; id_num = int(num); msg_id = msg.get('id')
-            if msg_id in procesados: return jsonify({"status": "ok"}), 200
-            procesados.add(msg_id)
+        if 'messages' not in data: return "OK", 200
+        
+        msg = data['messages'][0]; num = msg['from']
+        txt = msg.get('text', {}).get('body', '')
+        nombre = data['contacts'][0]['profile']['name']
 
-            conn = get_db_connection(); cur = conn.cursor()
+        # --- GESTIÓN DEL ADMIN ---
+        if num == ADMIN_PHONE:
+            cmd = txt.lower()
+            if "activar prueba" in cmd:
+                conn=get_db(); cur=conn.cursor()
+                cur.execute("UPDATE config SET value='true' WHERE key='test_mode'")
+                conn.commit(); conn.close()
+                enviar_whatsapp(num, "🧪 MODO PRUEBA: ON (Eres cliente).")
+                return "OK", 200
             
-            # 1. Registro Inicial "Mudo" (Para evitar error de Foreign Key)
-            cur.execute("SELECT id FROM cliente WHERE id = %s", (id_num,))
-            if not cur.fetchone():
-                cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, 'Cliente Nuevo', %s)", (id_num, str(num)))
-                conn.commit()
+            if "desactivar prueba" in cmd:
+                conn=get_db(); cur=conn.cursor()
+                cur.execute("UPDATE config SET value='false' WHERE key='test_mode'")
+                conn.commit(); conn.close()
+                enviar_whatsapp(num, "✅ MODO PRUEBA: OFF (Eres Admin).")
+                return "OK", 200
+
+            if "apagar bot" in cmd:
+                conn=get_db(); cur=conn.cursor()
+                cur.execute("UPDATE config SET value='false' WHERE key='bot_activo'")
+                conn.commit(); conn.close()
+                enviar_whatsapp(num, "🔴 Bot APAGADO.")
+                return "OK", 200
+                
+            if "encender bot" in cmd:
+                conn=get_db(); cur=conn.cursor()
+                cur.execute("UPDATE config SET value='true' WHERE key='bot_activo'")
+                conn.commit(); conn.close()
+                enviar_whatsapp(num, "🟢 Bot ENCENDIDO.")
+                return "OK", 200
+
+            # Verificar si Admin está en MODO PRUEBA
+            conn=get_db(); cur=conn.cursor()
+            cur.execute("SELECT value FROM config WHERE key='test_mode'")
+            res_test = cur.fetchone()
+            conn.close()
             
-            # Verificar Test Mode
-            cur.execute("SELECT value FROM config WHERE key = 'test_mode'")
-            row = cur.fetchone(); test_mode = row['value'] == 'true' if row else False
-            cur.close(); conn.close()
+            # Si NO está en modo prueba, salir (ignorar comandos de cliente)
+            if not res_test or res_test['value'] == 'false':
+                return "OK", 200
 
-            # Rutas
-            if str(num).replace("+","") == ADMIN_PHONE and not test_mode:
-                return jsonify({"status": "admin_mode"}), 200 # Aquí iría tu lógica admin
+        # --- GESTIÓN DE CLIENTES ---
+        
+        # 1. Verificar Interruptor General
+        conn=get_db(); cur=conn.cursor()
+        cur.execute("SELECT value FROM config WHERE key='bot_activo'")
+        res_bot = cur.fetchone()
+        conn.close()
+        if not res_bot or res_bot['value'] == 'false':
+            return "OK", 200 # Bot apagado
 
-            # Cliente (o Admin en Test)
-            if msg['type'] == 'text':
-                txt = msg['text']['body']
-                # Salida Emergencia
-                if "[MODO_PRUEBA:OFF]" in txt: 
-                    conn = get_db_connection(); cur = conn.cursor()
-                    cur.execute("UPDATE config SET value = 'false' WHERE key = 'test_mode'")
-                    conn.commit(); cur.close(); conn.close()
-                    enviar_meta(num, "✅ Modo Prueba OFF"); return jsonify({"status": "ok"}), 200
+        # 2. Manejo de Ubicación
+        if msg['type'] == 'location':
+            loc = f"GPS: http://maps.google.com/?q={msg['location']['latitude']},{msg['location']['longitude']}"
+            txt = loc 
 
-                if id_num in user_buffers:
-                    user_buffers[id_num]["timer"].cancel(); user_buffers[id_num]["text"] += f" {txt}"
-                else: user_buffers[id_num] = {"text": txt}
-                t = threading.Timer(5.0, procesar_flujo_cliente, args=[id_num, num, txt])
-                user_buffers[id_num]["timer"] = t; t.start()
-            
-            elif msg['type'] == 'image':
-                # Procesar imagen inmediatamente (sin delay 5s) para agilidad
-                threading.Thread(target=procesar_flujo_cliente, args=(id_num, num, "", True, msg['image']['id'])).start()
+        # 3. BUFFER DE 5 SEGUNDOS (Debouncing)
+        if num in user_buffers:
+            user_buffers[num]['timer'].cancel() # Resetear timer
+            user_buffers[num]['text'] += f" {txt}"
+        else:
+            user_buffers[num] = {'text': txt}
+        
+        # Ejecutar tras 5 segundos de silencio
+        t = threading.Timer(5.0, procesar_cliente, args=[num, nombre, user_buffers[num]['text']])
+        user_buffers[num]['timer'] = t
+        t.start()
+        
+        # Limpieza diferida del buffer
+        threading.Timer(6.0, lambda: user_buffers.pop(num, None)).start()
 
-    except: pass
-    return jsonify({"status": "ok"}), 200
+    except Exception as e: print(e)
+    return "OK", 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=10000)
