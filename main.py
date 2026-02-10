@@ -131,6 +131,14 @@ def consultar_ia(prompt, entrada):
         return res.json()['choices'][0]['message']['content']
     except: return "Error técnico IA."
 
+# --- HELPER: EXTRAER ETIQUETAS CON REGEX (INTELIGENTE) ---
+def extraer_tag(tag, texto):
+    # Busca [TAG: valor] ignorando mayúsculas/tildes
+    # Ej: [Dirección: hola] -> match
+    patron = fr"\[{tag}:(.*?)(?:\]|$)"
+    match = re.search(patron, texto, re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
 # --- CLIENTE ---
 def procesar_cliente(telefono, nombre_wa, mensaje):
     conn = get_db(); cur = conn.cursor()
@@ -149,64 +157,72 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     
     historial_chat = obtener_historial(telefono)
 
-    # 🔥 PROMPT CORREGIDO: MÁS AGRESIVO CON LA ETIQUETA
     prompt = f"""
     CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
     TASAS: USD={tasas['usd']} Bs.
-    
-    REGLA DE PRECIOS: Si mencionas $, pon al lado los Bs.
     
     CLIENTE: {nombre_real}
     CARRITO: {carrito_txt}
     HISTORIAL: {historial_chat}
     
-    ACCIONES OBLIGATORIAS:
-    1. Si es Nuevo -> [NOMBRE: ...]
-    2. Si pide -> [AGENDAR: Resumen | Monto USD]
-    3. Si cancela -> [CANCELAR]
-    4. SI ESCRIBE UNA DIRECCIÓN (aunque sea vaga) -> USA LA ETIQUETA [DIRECCION: ...] DE INMEDIATO. NO preguntes "¿es correcta?". ASUME que es la dirección y procésala.
+    ACCIONES (Usa EXACTAMENTE este formato):
+    1. Nuevo -> [NOMBRE: nombre]
+    2. Agrega -> [AGENDAR: Resumen | Monto USD]
+    3. Cancela -> [CANCELAR]
+    4. Dirección -> [DIRECCION: dirección completa] (¡OBLIGATORIO si el usuario da su ubicación!)
     """
     
     resp_ia = consultar_ia(prompt, mensaje)
-    print(f"🤖 IA DICE: {resp_ia}") # 👈 DEBUG EN LOGS DE RENDER
+    print(f"🤖 IA RAW: {resp_ia}") # Debug en logs
 
-    # --- ACCIONES ---
+    # --- PROCESAMIENTO INTELIGENTE ---
     msg_to_user = "" 
 
-    if "[NOMBRE:" in resp_ia:
-        n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
-        cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
-        
-    if "[AGENDAR:" in resp_ia:
-        d = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
-        resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
-        if pedido: cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
-        else: cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
-        
-    if "[CANCELAR]" in resp_ia:
+    # 1. Extraer Nombre
+    nombre_tag = extraer_tag("NOMBRE", resp_ia)
+    if nombre_tag:
+        cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (nombre_tag, telefono))
+
+    # 2. Extraer Pedido
+    agenda_tag = extraer_tag("AGENDAR", resp_ia)
+    if agenda_tag:
+        try:
+            d = agenda_tag.split("|")
+            resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
+            if pedido: cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
+            else: cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
+        except: pass
+
+    # 3. Cancelar
+    if "[CANCELAR]" in resp_ia.upper():
         cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
+
+    # 4. Dirección (CRÍTICO: Usa Regex para detectar variaciones)
+    direccion_tag = extraer_tag("DIRECCION", resp_ia) or extraer_tag("DIRECCIÓN", resp_ia)
+    
+    if direccion_tag:
+        # Guardar en DB
+        cur.execute("UPDATE pedidos SET direccion=%s, estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (direccion_tag, telefono))
         
-    if "[DIRECCION:" in resp_ia:
-        d = resp_ia.split("[DIRECCION:")[1].split("]")[0].strip()
-        cur.execute("UPDATE pedidos SET direccion=%s, estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (d, telefono))
-        
-        # CÁLCULO FINAL Y MENSAJE DE RECIBO
+        # Calcular Totales
         monto_usd = pedido['monto_total'] if pedido else 0
         monto_bs = monto_usd * tasas['usd']
         
-        msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📍 Dirección: {d}\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Datos de Pago:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n\n📸 *Envía foto del pago para despachar.*"
+        # MENSAJE FORZADO (Evita silencio)
+        msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📍 Dirección: {direccion_tag}\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Datos de Pago:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n\n📸 *Envía foto del pago para despachar.*"
         
         if ADMIN_PHONE_CLEAN:
-            try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO\nCliente: {nombre_real}\nDir: {d}\nTotal: {monto_bs:.2f} Bs")
+            try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO\nCliente: {nombre_real}\nDir: {direccion_tag}\nTotal: {monto_bs:.2f} Bs")
             except: pass
 
     conn.commit(); conn.close()
     
-    # RESPUESTA
+    # RESPUESTA FINAL
     if msg_to_user:
         enviar_whatsapp(telefono, msg_to_user)
         guardar_mensaje(telefono, 'assistant', msg_to_user)
     else:
+        # Limpiar tags y enviar solo si queda texto
         clean_resp = re.sub(r'\[.*?\]', '', resp_ia).strip()
         if clean_resp:
             enviar_whatsapp(telefono, clean_resp)
