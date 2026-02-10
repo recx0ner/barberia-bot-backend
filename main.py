@@ -74,7 +74,25 @@ def obtener_tasas():
     except: pass
     return cache_tasas
 
-# --- PAGOS (VISIÓN) ---
+# --- HELPER: LIMPIEZA DE MONTOS VENEZOLANOS ---
+def limpiar_monto_bs(valor_raw):
+    try:
+        # Convierte "1.950,00" -> 1950.00
+        # Convierte "1950" -> 1950.00
+        v = str(valor_raw).strip()
+        v = v.replace("Bs.", "").replace("Bs", "").strip()
+        
+        if "," in v and "." in v: # Caso 1.950,00
+            v = v.replace(".", "") # Quita miles (1950,00)
+            v = v.replace(",", ".") # Cambia decimal (1950.00)
+        elif "," in v: # Caso 100,50
+            v = v.replace(",", ".")
+            
+        return float(v)
+    except:
+        return 0.0
+
+# --- PAGOS ---
 def procesar_pago(image_id, cliente_id):
     try:
         url_get = f"https://graph.facebook.com/v17.0/{image_id}"
@@ -85,12 +103,13 @@ def procesar_pago(image_id, cliente_id):
         img_data = requests.get(res_url, headers=headers).content
         b64_img = base64.b64encode(img_data).decode('utf-8')
 
+        # Prompt Especializado en Formato Venezolano
         url_ai = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": "google/gemini-2.0-flash-001",
             "messages": [
                 {"role": "user", "content": [
-                    {"type": "text", "text": "Extrae REFERENCIA (números) y MONTO. JSON: {\"ref\": \"1234\", \"monto\": 100.00}. Si falla: {\"error\": true}"},
+                    {"type": "text", "text": "Extrae REFERENCIA (números completos) y MONTO (números). IMPORTANTE: Si el monto es '1.950,00' o '1,950.00', devuélvelo como número decimal estándar: 1950.00. JSON: {\"ref\": \"123456\", \"monto\": 1950.00}. Si falla: {\"error\": true}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
                 ]}
             ]
@@ -100,21 +119,58 @@ def procesar_pago(image_id, cliente_id):
         datos = json.loads(content)
 
         if "error" in datos:
-            enviar_whatsapp(cliente_id, "⚠️ No pude leer el comprobante.")
+            enviar_whatsapp(cliente_id, "⚠️ No pude leer el comprobante. Intenta enviarlo más nítido.")
             return
 
+        # Limpieza de seguridad en Python
+        monto_real = limpiar_monto_bs(datos['monto'])
+        ref_real = str(datos['ref'])
+
         conn = get_db(); cur = conn.cursor()
-        cur.execute("SELECT id FROM pagos WHERE referencia = %s", (str(datos['ref']),))
+        
+        # Antifraude
+        cur.execute("SELECT id FROM pagos WHERE referencia = %s", (ref_real,))
         if cur.fetchone():
-            enviar_whatsapp(cliente_id, f"❌ ERROR: Referencia {datos['ref']} DUPLICADA.")
+            enviar_whatsapp(cliente_id, f"❌ ERROR: La referencia {ref_real} YA EXISTE en el sistema.")
             conn.close(); return
 
-        cur.execute("INSERT INTO pagos (cliente_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (cliente_id, str(datos['ref']), datos['monto']))
+        # Registro
+        cur.execute("INSERT INTO pagos (cliente_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (cliente_id, ref_real, monto_real))
         conn.commit()
-        enviar_whatsapp(cliente_id, f"✅ Pago registrado (Ref: {datos['ref']}).")
+
+        # --- LÓGICA DE SALDO RESTANTE ---
+        tasas = obtener_tasas()
+        cur.execute("SELECT monto_total FROM pedidos WHERE cliente_id = %s AND estado IN ('carrito', 'confirmado') LIMIT 1", (cliente_id,))
+        pedido = cur.fetchone()
+        
+        # Mensaje Base (Siempre muestra lo que detectó)
+        mensaje_cliente = f"✅ *Pago Registrado*\n🔖 Ref: {ref_real}\n💵 Monto: {monto_real:,.2f} Bs"
+        msg_admin_extra = ""
+
+        if pedido:
+            total_pedido_bs = float(pedido['monto_total']) * tasas['usd']
+            
+            # Sumar histórico de pagos
+            cur.execute("SELECT SUM(monto) as pagado FROM pagos WHERE cliente_id = %s AND estado IN ('pendiente', 'aprobado')", (cliente_id,))
+            res_pagos = cur.fetchone()
+            total_pagado = float(res_pagos['pagado']) if res_pagos and res_pagos['pagado'] else 0.0
+            
+            restante = total_pedido_bs - total_pagado
+            
+            if restante > 1.0: # Margen de error 1 Bs
+                mensaje_cliente += f"\n\n📉 *Abonado Total:* {total_pagado:,.2f} Bs\n⚠️ *Resta por Pagar:* {restante:,.2f} Bs\n(Total Pedido: {total_pedido_bs:,.2f} Bs)"
+                msg_admin_extra = f"\n⚠️ Debe: {restante:,.2f} Bs"
+            else:
+                mensaje_cliente += "\n\n🎉 *¡Pago Completado!* Has cubierto el total."
+                msg_admin_extra = "\n✅ Pagado 100%"
+        
+        enviar_whatsapp(cliente_id, mensaje_cliente)
+        
         if ADMIN_PHONE_CLEAN:
-            enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *PAGO PENDIENTE*\nRef: {datos['ref']}\nMonto: {datos['monto']} Bs\nResponde 'Sí' para aprobar.")
+            enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *NUEVO PAGO*\nRef: {ref_real}\nMonto: {monto_real:,.2f} Bs{msg_admin_extra}\nResponde 'Sí' para aprobar.")
+        
         conn.close()
+
     except Exception as e: print(f"Error Pago: {e}")
 
 # --- IA ---
@@ -149,14 +205,14 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     
     historial_chat = obtener_historial(telefono)
 
-    # 🔥 PROMPT MODIFICADO: MODO "RETIRO EN TIENDA"
+    # PROMPT SIMPLIFICADO: RETIRO EN TIENDA
     prompt = f"""
     CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
     TASAS: USD={tasas['usd']} Bs.
     
-    ⚠️ POLITICA DE ENTREGA: NO TENEMOS DELIVERY. Todo pedido se retira por el local.
+    POLITICA ENTREGA: NO hacemos delivery. El cliente debe buscar en el local.
     
-    REGLA DE PRECIOS: Si mencionas $, pon al lado los Bs.
+    REGLA DE PRECIOS: Si mencionas $, calcula y pon al lado los Bs.
     
     CLIENTE: {nombre_real}
     CARRITO: {carrito_txt}
@@ -166,11 +222,11 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     1. Nuevo -> [NOMBRE: nombre]
     2. Agrega -> [AGENDAR: Resumen | Monto USD]
     3. Cancela -> [CANCELAR]
-    4. SI EL CLIENTE CONFIRMA, DICE "OK", "LO QUIERO" O PREGUNTA CÓMO PAGAR -> [FINALIZAR] (Esto cierra la venta para retiro).
+    4. Cierre -> [FINALIZAR] (Si confirma, dice OK, pregunta cuenta o dice 'lo paso buscando').
     """
     
     resp_ia = consultar_ia(prompt, mensaje)
-    print(f"🤖 IA RAW: {resp_ia}")
+    print(f"🤖 IA: {resp_ia}")
 
     # --- ACCIONES ---
     msg_to_user = "" 
@@ -188,24 +244,20 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     if "[CANCELAR]" in resp_ia:
         cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
         
-    # 🔥 ACCIÓN DE CIERRE SIMPLIFICADA (SIN DIRECCIÓN)
     if "[FINALIZAR]" in resp_ia:
-        # Guardamos "Retiro en Tienda" automáticamente
         cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
         
         monto_usd = pedido['monto_total'] if pedido else 0
         monto_bs = monto_usd * tasas['usd']
         
-        # Mensaje de Cierre
-        msg_to_user = f"✅ *¡Pedido Confirmado para Retirar!*\n\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Datos de Pago:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n\n📍 *Te esperamos en el local para entregarte.*\n📸 Envía foto del pago para preparar tu pedido."
+        msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📝 Pedido: {pedido['resumen'] if pedido else 'Varios'}\n💵 Total: ${monto_usd:.2f} ({monto_bs:,.2f} Bs)\n\n📍 *Debes retirarlo en nuestro local.*\n\n📲 *Pago Móvil:*\n- 0412-1234567\n- Banco Venezuela\n- RIF: V-12345678\n\n📸 *Envía el comprobante para apartar tu pedido.*"
         
         if ADMIN_PHONE_CLEAN:
-            try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO (RETIRO)\nCliente: {nombre_real}\nTotal: {monto_bs:.2f} Bs")
+            try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO (RETIRO)\nCliente: {nombre_real}\nTotal: {monto_bs:,.2f} Bs")
             except: pass
 
     conn.commit(); conn.close()
     
-    # RESPUESTA
     if msg_to_user:
         enviar_whatsapp(telefono, msg_to_user)
         guardar_mensaje(telefono, 'assistant', msg_to_user)
@@ -256,7 +308,6 @@ def webhook():
 
         if msg['type'] == 'image': threading.Thread(target=procesar_pago, args=(msg['image']['id'], num)).start(); return "OK", 200
         
-        # 🚨 IGNORAMOS UBICACIONES PARA EVITAR PROBLEMAS
         if msg['type'] == 'location': return "OK", 200 
 
         if num in user_buffers: user_buffers[num]['timer'].cancel(); user_buffers[num]['text'] += f" {txt}"
