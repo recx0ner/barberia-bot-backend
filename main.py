@@ -17,160 +17,129 @@ procesados = set()
 user_buffers = {} 
 
 def get_db_connection():
-    try:
-        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    except Exception as e:
-        print(f"❌ Error DB: {e}")
-        return None
-
-def obtener_tasas_dinamicas():
-    conn = get_db_connection()
-    tasas = {"usd": 385.50, "eur": 415.00}
-    if not conn: return tasas
-    cur = conn.cursor()
-    try:
-        r_usd = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=3).json()
-        tasas['usd'] = float(r_usd['rates']['VES'])
-        r_eur = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=3).json()
-        tasas['eur'] = float(r_eur['rates']['VES'])
-    except: pass
-    finally: cur.close(); conn.close()
-    return tasas
+    try: return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    except: return None
 
 def enviar_meta(to, text):
     try:
         url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-        payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
-        requests.post(url, headers=headers, json=payload, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Error enviando a Meta: {e}")
+        requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}, timeout=10)
+    except: pass
 
-# 🛡️ IA BLINDADA
-def consultar_ia(instruccion, texto, historial="", img_id=None):
+# 👁️ SISTEMA DE VISIÓN (OCR DE PAGOS)
+def analizar_comprobante(img_id):
     try:
-        img_b64 = None
-        if img_id:
-            try:
-                res = requests.get(f"https://graph.facebook.com/v18.0/{img_id}", headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=10)
-                img_url = res.json().get('url')
-                if img_url:
-                    img_data = requests.get(img_url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=10).content
-                    img_b64 = base64.b64encode(img_data).decode('utf-8')
-            except: pass
+        # Descargar imagen de Meta
+        url_get = f"https://graph.facebook.com/v18.0/{img_id}"
+        headers = {"Authorization": f"Bearer {META_TOKEN}"}
+        res_url = requests.get(url_get, headers=headers).json().get('url')
+        img_data = requests.get(res_url, headers=headers).content
+        img_b64 = base64.b64encode(img_data).decode('utf-8')
 
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-        
+        # Consultar a Gemini Vision
+        url_ai = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": MODELO_IA,
             "messages": [
-                {"role": "system", "content": instruccion},
-                {"role": "user", "content": [
-                    {"type": "text", "text": f"{historial}\nActual: {texto}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}} if img_b64 else None
-                ]}
-            ],
+                {"role": "system", "content": "Eres un auditor financiero. Extrae la REFERENCIA (números) y el MONTO del comprobante bancario. Responde SOLO en JSON: {\"ref\": \"123456\", \"monto\": 100.50}. Si no es un pago, responde {\"error\": \"no_es_pago\"}."},
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}
+            ]
+        }
+        res = requests.post(url_ai, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, json=payload).json()
+        content = res['choices'][0]['message']['content'].replace("```json", "").replace("```", "").strip()
+        return json.loads(content)
+    except Exception as e:
+        print(f"Error OCR: {e}")
+        return {"error": "falla_tecnica"}
+
+def consultar_ia(instruccion, texto, historial=""):
+    try:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        payload = {
+            "model": MODELO_IA,
+            "messages": [{"role": "system", "content": instruccion}, {"role": "user", "content": f"{historial}\nActual: {texto}"}],
             "temperature": 0.1
         }
-        payload["messages"][1]["content"] = [i for i in payload["messages"][1]["content"] if i]
-
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if 'choices' in data: return data['choices'][0]['message']['content']
-        return "⚠️ Error de conexión."
-
-    except Exception as e:
-        print(f"🔥 Error IA: {e}")
-        return "⚠️ Error técnico."
-
-# --- ADMIN ---
-def ejecutar_comando_admin(msg_text, num):
-    try:
-        conn = get_db_connection()
-        if not conn: return
-        cur = conn.cursor()
-        
-        prompt = "ADMIN: [BOT:ON], [BOT:OFF], [CONSULTAR_TASA], [MODO_PRUEBA:ON]."
-        intent = consultar_ia(prompt, msg_text)
-        
-        if "[MODO_PRUEBA:ON]" in intent:
-            cur.execute("UPDATE config SET value = 'true' WHERE key = 'test_mode'")
-            enviar_meta(num, "🧪 MODO PRUEBA ON")
-        elif "[CONSULTAR_TASA]" in intent:
-            t = obtener_tasas_dinamicas()
-            enviar_meta(num, f"📊 USD: {t['usd']} | EUR: {t['eur']}")
-        else:
-            enviar_meta(num, "✅ Admin OK.")
-        
-        conn.commit(); cur.close(); conn.close()
+        res = requests.post(url, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, json=payload, timeout=15).json()
+        if 'choices' in res: return res['choices'][0]['message']['content']
     except: pass
+    return "⚠️ Error de conexión."
 
-# --- CLIENTE ---
-def procesar_flujo_cliente(id_num, num, name_wa, texto_extra=None):
+# --- FLUJO CLIENTE ---
+def procesar_flujo_cliente(id_num, num, texto_entrada, es_imagen=False, img_id=None):
     try:
-        conn = get_db_connection()
-        if not conn: return
-        cur = conn.cursor()
-
-        buffer = user_buffers.get(id_num, {"text": ""})
-        texto_acum = (buffer.get("text", "") + " " + (texto_extra or "")).strip()
-        if id_num in user_buffers: del user_buffers[id_num]
+        conn = get_db_connection(); cur = conn.cursor()
         
-        if not texto_acum: 
-            cur.close(); conn.close(); return
+        # Buffer de texto
+        if not es_imagen:
+            buffer = user_buffers.get(id_num, {"text": ""})
+            texto_acum = (buffer.get("text", "") + " " + texto_entrada).strip()
+            if id_num in user_buffers: del user_buffers[id_num]
+        else:
+            texto_acum = "[IMAGEN_ENVIADA]"
 
-        t = obtener_tasas_dinamicas()
+        # 💰 LÓGICA DE PAGOS (Antifraude)
+        info_pago = ""
+        if es_imagen and img_id:
+            datos = analizar_comprobante(img_id)
+            if "ref" in datos:
+                # Verificar duplicado
+                cur.execute("SELECT id FROM pagos WHERE referencia = %s", (str(datos['ref']),))
+                if cur.fetchone():
+                    enviar_meta(num, f"❌ La referencia {datos['ref']} ya fue registrada antes.")
+                    return # Cortamos flujo aquí
+                else:
+                    # Registrar pago
+                    cur.execute("INSERT INTO pagos (user_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (id_num, str(datos['ref']), datos['monto']))
+                    conn.commit()
+                    info_pago = f"SISTEMA: El cliente envió comprobante Ref {datos['ref']} por {datos['monto']} Bs. CALCULA EL RESTANTE."
+            else:
+                info_pago = "SISTEMA: El cliente envió una imagen que NO parece un pago."
+
+        # Historial
         cur.execute("SELECT user_input, bot_response FROM messages WHERE user_id = %s ORDER BY id DESC LIMIT 6", (id_num,))
-        hist = "".join([f"Usuario: {f['user_input']}\nBot: {f['bot_response']}\n" for f in reversed(cur.fetchall())])
+        hist = "".join([f"U: {f['user_input']}\nB: {f['bot_response']}\n" for f in reversed(cur.fetchall())])
         
-        # PROMPT CORREGIDO: ETIQUETAS AL FINAL
-        instr = f"""{BUSINESS_CONTEXT}\nTasa: {t['usd']} Bs.\n
-        REGLAS DE FORMATO (IMPORTANTE):
-        1. NO uses prefijos como "Bot:" o "B:". Responde directamente.
-        2. Escribe de forma natural. NO incluyas etiquetas dentro de las oraciones.
-        3. Pon las etiquetas TÉCNICAS SIEMPRE AL FINAL del mensaje, en una línea separada.
+        # Recuperar nombre actual
+        cur.execute("SELECT nombre FROM cliente WHERE id = %s", (id_num,))
+        cliente_db = cur.fetchone()
+        nombre_actual = cliente_db['nombre'] if cliente_db else "Por definir"
+
+        prompt = f"""{BUSINESS_CONTEXT}
+        Cliente: {nombre_actual}.
+        Nota del Sistema: {info_pago}
         
-        ETIQUETAS DISPONIBLES:
-        - [NOMBRE: nombre detectado]
-        - [AGENDAR] (si pide producto)
-        - [FINALIZAR] (si da dirección/GPS -> da el total y pago móvil)
-        - [DIRECCION: dirección detectada]
-        - [CANCELAR]
+        REGLAS DE FLUJO:
+        1. Si el nombre es "Por definir" o "Cliente Nuevo", TU PRIORIDAD es preguntar su nombre. NO tomes pedido aún.
+        2. Cuando te diga su nombre, usa la etiqueta [NOMBRE: ...].
+        3. Si envía pago: Confirma recepción, resta el monto del total del pedido y dile cuánto le falta (o si está listo).
+        4. ETIQUETAS AL FINAL: [AGENDAR], [FINALIZAR], [CANCELAR], [DIRECCION:...].
+        5. [CANCELAR]: Úsalo si el cliente dice "cancela", "olvídalo" o "no quiero nada".
         """
-        
-        res_ia = consultar_ia(instr, texto_acum, hist)
 
-        # Limpieza de prefijos alucinados (Solución a image_1fc7d0)
-        res_ia = res_ia.replace("Bot:", "").replace("B:", "").strip()
+        res_ia = consultar_ia(prompt, texto_acum, hist)
 
-        # Procesar etiquetas
+        # Procesar Etiquetas
         if "[NOMBRE:" in res_ia:
-            try:
-                n = res_ia.split("[NOMBRE:")[1].split("]")[0].strip()
-                cur.execute("UPDATE cliente SET nombre = %s WHERE id = %s", (n, id_num))
-            except: pass
+            n = res_ia.split("[NOMBRE:")[1].split("]")[0].strip()
+            cur.execute("UPDATE cliente SET nombre = %s WHERE id = %s", (n, id_num))
+        
+        if "[CANCELAR]" in res_ia:
+            cur.execute("UPDATE pedidos SET estado = 'cancelado' WHERE user_id = %s AND estado IN ('confirmando','esperando_pago')", (id_num,))
+            res_ia = "Entendido, pedido cancelado. Avísame si deseas algo más." # Respuesta forzada limpia
 
         if "[AGENDAR]" in res_ia:
             cur.execute("INSERT INTO pedidos (user_id, estado) VALUES (%s, 'confirmando') ON CONFLICT DO NOTHING", (id_num,))
-        
-        if "[DIRECCION:" in res_ia:
-            try:
-                d = res_ia.split("[DIRECCION:")[1].split("]")[0].strip()
-                cur.execute("UPDATE pedidos SET direccion = %s WHERE user_id = %s AND estado = 'confirmando'", (d, id_num))
-            except: pass
 
         if "[FINALIZAR]" in res_ia: 
             cur.execute("UPDATE pedidos SET estado = 'esperando_pago' WHERE user_id = %s AND estado = 'confirmando'", (id_num,))
-            enviar_meta(ADMIN_PHONE, f"🚨 NUEVO PEDIDO: {name_wa}")
+            enviar_meta(ADMIN_PHONE, f"🚨 PEDIDO CONFIRMADO: {nombre_actual}")
 
         conn.commit()
-
-        # Limpiar etiquetas del mensaje final al cliente
-        limpia = re.sub(r'\[.*?\]', '', res_ia).strip()
         
+        # Limpieza
+        limpia = re.sub(r'\[.*?\]', '', res_ia).replace("Bot:", "").strip()
         if limpia:
             enviar_meta(num, limpia)
             cur.execute("INSERT INTO messages (user_id, user_input, bot_response) VALUES (%s, %s, %s)", (id_num, texto_acum, limpia))
@@ -178,66 +147,56 @@ def procesar_flujo_cliente(id_num, num, name_wa, texto_extra=None):
             
         cur.close(); conn.close()
 
-    except Exception as e:
-        print(f"🔥 Error Flujo: {e}")
+    except Exception as e: print(f"Error: {e}")
 
 @app.route('/whatsapp', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'GET': return request.args.get("hub.challenge"), 200
-    
     try:
-        body = request.json
-        entry = body.get('entry', [])[0]
-        changes = entry.get('changes', [])[0]
-        value = changes.get('value', {})
-        
-        if 'messages' in value:
-            msg = value['messages'][0]
-            num = msg['from']; id_num = int(num); msg_id = msg.get('id')
-
+        data = request.json['entry'][0]['changes'][0]['value']
+        if 'messages' in data:
+            msg = data['messages'][0]; num = msg['from']; id_num = int(num); msg_id = msg.get('id')
             if msg_id in procesados: return jsonify({"status": "ok"}), 200
             procesados.add(msg_id)
 
-            conn = get_db_connection()
-            if not conn: return jsonify({"status": "ok"}), 200
-            cur = conn.cursor()
+            conn = get_db_connection(); cur = conn.cursor()
             
+            # 1. Registro Inicial "Mudo" (Para evitar error de Foreign Key)
+            cur.execute("SELECT id FROM cliente WHERE id = %s", (id_num,))
+            if not cur.fetchone():
+                cur.execute("INSERT INTO cliente (id, nombre, telefono) VALUES (%s, 'Cliente Nuevo', %s)", (id_num, str(num)))
+                conn.commit()
+            
+            # Verificar Test Mode
             cur.execute("SELECT value FROM config WHERE key = 'test_mode'")
-            row = cur.fetchone()
-            test_mode = row['value'] == 'true' if row else False
-            num_lim = str(num).replace("+", "").strip()
-            msg_body = msg.get('text', {}).get('body', "")
-
-            if num_lim == ADMIN_PHONE and "[MODO_PRUEBA:OFF]" in msg_body:
-                cur.execute("UPDATE config SET value = 'false' WHERE key = 'test_mode'")
-                conn.commit(); cur.close(); conn.close()
-                enviar_meta(num, "✅ Modo Prueba OFF.")
-                return jsonify({"status": "ok"}), 200
-
+            row = cur.fetchone(); test_mode = row['value'] == 'true' if row else False
             cur.close(); conn.close()
 
-            if num_lim == ADMIN_PHONE and not test_mode:
-                threading.Thread(target=ejecutar_comando_admin, args=(msg_body, num)).start()
-            else:
-                name_wa = value.get('contacts', [{}])[0].get('profile', {}).get('name', 'Cliente')
-                
-                if msg.get('type') == 'location':
-                    gps = f"{msg['location']['latitude']},{msg['location']['longitude']}"
-                    conn = get_db_connection(); cur = conn.cursor()
-                    cur.execute("UPDATE pedidos SET gps = %s WHERE user_id = %s AND estado = 'confirmando'", (gps, id_num))
-                    conn.commit(); cur.close(); conn.close()
-                    threading.Thread(target=procesar_flujo_cliente, args=(id_num, num, name_wa, "He enviado mi GPS.")).start()
-                
-                elif msg.get('type') == 'text':
-                    if id_num in user_buffers:
-                        user_buffers[id_num]["timer"].cancel()
-                        user_buffers[id_num]["text"] += f" {msg_body}"
-                    else:
-                        user_buffers[id_num] = {"text": msg_body}
-                    t = threading.Timer(5.0, procesar_flujo_cliente, args=[id_num, num, name_wa])
-                    user_buffers[id_num]["timer"] = t; t.start()
+            # Rutas
+            if str(num).replace("+","") == ADMIN_PHONE and not test_mode:
+                return jsonify({"status": "admin_mode"}), 200 # Aquí iría tu lógica admin
 
-    except Exception as e: print(f"🔥 Error: {e}")
+            # Cliente (o Admin en Test)
+            if msg['type'] == 'text':
+                txt = msg['text']['body']
+                # Salida Emergencia
+                if "[MODO_PRUEBA:OFF]" in txt: 
+                    conn = get_db_connection(); cur = conn.cursor()
+                    cur.execute("UPDATE config SET value = 'false' WHERE key = 'test_mode'")
+                    conn.commit(); cur.close(); conn.close()
+                    enviar_meta(num, "✅ Modo Prueba OFF"); return jsonify({"status": "ok"}), 200
+
+                if id_num in user_buffers:
+                    user_buffers[id_num]["timer"].cancel(); user_buffers[id_num]["text"] += f" {txt}"
+                else: user_buffers[id_num] = {"text": txt}
+                t = threading.Timer(5.0, procesar_flujo_cliente, args=[id_num, num, txt])
+                user_buffers[id_num]["timer"] = t; t.start()
+            
+            elif msg['type'] == 'image':
+                # Procesar imagen inmediatamente (sin delay 5s) para agilidad
+                threading.Thread(target=procesar_flujo_cliente, args=(id_num, num, "", True, msg['image']['id'])).start()
+
+    except: pass
     return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
