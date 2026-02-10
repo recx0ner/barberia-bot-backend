@@ -42,16 +42,14 @@ def enviar_whatsapp(to, body):
         requests.post(url, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}}, headers=headers, timeout=5)
     except Exception as e: print(f"Error WA: {e}")
 
-# --- GESTIÓN DE MEMORIA (NUEVO) ---
+# --- GESTIÓN DE MEMORIA ---
 def obtener_historial(cliente_id):
     conn = get_db()
     if not conn: return ""
     cur = conn.cursor()
-    # Traemos los últimos 6 mensajes para dar contexto sin gastar muchos tokens
     cur.execute("SELECT role, content FROM messages WHERE cliente_id = %s ORDER BY id DESC LIMIT 6", (cliente_id,))
     rows = cur.fetchall()
     conn.close()
-    # Reordenamos cronológicamente
     historial = ""
     for r in reversed(rows):
         role = "Cliente" if r['role'] == 'user' else "Tú (Asistente)"
@@ -65,15 +63,19 @@ def guardar_mensaje(cliente_id, role, content):
         cur.execute("INSERT INTO messages (cliente_id, role, content) VALUES (%s, %s, %s)", (cliente_id, role, content))
         conn.commit(); conn.close()
 
-# --- TASAS ---
+# --- TASAS (API) ---
 def obtener_tasas():
     global cache_tasas
     if time.time() < cache_tasas["expira"]: return cache_tasas
     try:
+        # API Externa
         t_usd = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=3).json()['rates']['VES']
         t_eur = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=3).json()['rates']['VES']
         cache_tasas = {"usd": float(t_usd), "eur": float(t_eur), "expira": time.time() + 3600}
-    except: pass # Si falla, usa caché anterior o 0.0
+        print(f"🔄 TASAS ACTUALIZADAS: USD {t_usd} | EUR {t_eur}")
+    except Exception as e: 
+        print(f"⚠️ Error Tasas: {e}")
+        # Si falla, intentamos mantener la última conocida o 0.0
     return cache_tasas
 
 # --- PAGOS (VISIÓN) ---
@@ -132,7 +134,7 @@ def consultar_ia(prompt, entrada):
         return res.json()['choices'][0]['message']['content']
     except: return "Error técnico IA."
 
-# --- LÓGICA CLIENTE CON MEMORIA ---
+# --- PROCESO CLIENTE (CON CÁLCULO DE DIVISAS) ---
 def procesar_cliente(telefono, nombre_wa, mensaje):
     conn = get_db(); cur = conn.cursor()
     
@@ -147,36 +149,40 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
 
     # 2. Contexto
     tasas = obtener_tasas()
+    print(f"💰 Tasa usada para el prompt: {tasas['usd']} Bs") # Debug en Render logs
+
     cur.execute("SELECT resumen, monto_total FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1", (telefono,))
     pedido = cur.fetchone()
     carrito_txt = f"Carrito: {pedido['resumen']} (${pedido['monto_total']})" if pedido else "Vacio"
     
-    # 3. RECUPERAR MEMORIA (HISTORIAL)
     historial_chat = obtener_historial(telefono)
 
-    # 4. Prompt Reforzado
+    # 3. PROMPT MAESTRO (Instrucciones de Cálculo)
     prompt = f"""
-    CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
-    TASAS: USD={tasas['usd']} Bs | EUR={tasas['eur']} Bs.
+    CONTEXTO DE NEGOCIO: {CONFIG['BUSINESS_CONTEXT']}
     
-    PERFIL CLIENTE:
-    - Nombre BD: {nombre_real} (Si es 'Nuevo' o 'Cliente Nuevo', intenta conseguir su nombre real).
-    - Estado Carrito: {carrito_txt}
+    ⚠️ REGLA DE ORO DE PRECIOS:
+    La Tasa del Dólar HOY es: {tasas['usd']} Bs.
+    SIEMPRE que menciones un precio en Dólares ($), DEBES calcular y escribir al lado el monto en Bolívares (Bs).
+    Ejemplo: "Son $10 (aprox. {10 * tasas['usd']} Bs)". ¡HAZ EL CÁLCULO!
+
+    DATOS CLIENTE:
+    - Nombre: {nombre_real}
+    - Carrito: {carrito_txt}
     
-    HISTORIAL DE CONVERSACIÓN RECIENTE:
+    HISTORIAL:
     {historial_chat}
     
-    INSTRUCCIONES TÉCNICAS:
-    1. Responde de forma natural usando el historial. NO repitas preguntas que ya contestó.
-    2. Si detectas un nombre nuevo: [NOMBRE: Juan Perez]
-    3. Si agrega productos: [AGENDAR: 2 Pizzas | 20.0] (Monto siempre en USD).
-    4. Si cancela: [CANCELAR]
-    5. Si da dirección: [DIRECCION: Calle 123...]
+    ACCIONES TÉCNICAS:
+    1. Nuevo cliente -> [NOMBRE: ...]
+    2. Agrega prod -> [AGENDAR: Resumen | Monto USD]
+    3. Cancela -> [CANCELAR]
+    4. Dirección -> [DIRECCION: ...]
     """
     
     resp_ia = consultar_ia(prompt, mensaje)
     
-    # 5. Ejecutar Acciones
+    # 4. Ejecutar Acciones
     if "[NOMBRE:" in resp_ia:
         n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
         cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
@@ -191,15 +197,14 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         d = resp_ia.split("[DIRECCION:")[1].split("]")[0].strip()
         cur.execute("UPDATE pedidos SET direccion=%s, estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (d, telefono))
         bs = (pedido['monto_total'] * tasas['usd']) if pedido else 0
-        enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 CONFIRMADO\nCliente: {nombre_real}\nDir: {d}\nTotal: {bs:.2f} Bs")
+        enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 CONFIRMADO\nCliente: {nombre_real}\nDir: {d}\nTotal: {bs:.2f} Bs (${pedido['monto_total']})")
 
     conn.commit(); conn.close()
     
-    # 6. Limpiar y Guardar en Memoria
+    # 5. Guardar y Responder
     clean_resp = re.sub(r'\[.*?\]', '', resp_ia).strip()
     if clean_resp:
         enviar_whatsapp(telefono, clean_resp)
-        # Guardamos la interacción
         guardar_mensaje(telefono, 'user', mensaje)
         guardar_mensaje(telefono, 'assistant', clean_resp)
 
