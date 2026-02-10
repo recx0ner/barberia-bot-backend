@@ -74,7 +74,7 @@ def obtener_tasas():
     except: pass
     return cache_tasas
 
-# --- PAGOS ---
+# --- PAGOS (VISIÓN) ---
 def procesar_pago(image_id, cliente_id):
     try:
         url_get = f"https://graph.facebook.com/v17.0/{image_id}"
@@ -131,14 +131,6 @@ def consultar_ia(prompt, entrada):
         return res.json()['choices'][0]['message']['content']
     except: return "Error técnico IA."
 
-# --- HELPER: EXTRAER ETIQUETAS CON REGEX (INTELIGENTE) ---
-def extraer_tag(tag, texto):
-    # Busca [TAG: valor] ignorando mayúsculas/tildes
-    # Ej: [Dirección: hola] -> match
-    patron = fr"\[{tag}:(.*?)(?:\]|$)"
-    match = re.search(patron, texto, re.IGNORECASE)
-    return match.group(1).strip() if match else None
-
 # --- CLIENTE ---
 def procesar_cliente(telefono, nombre_wa, mensaje):
     conn = get_db(); cur = conn.cursor()
@@ -157,72 +149,67 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     
     historial_chat = obtener_historial(telefono)
 
+    # 🔥 PROMPT MODIFICADO: MODO "RETIRO EN TIENDA"
     prompt = f"""
     CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
     TASAS: USD={tasas['usd']} Bs.
+    
+    ⚠️ POLITICA DE ENTREGA: NO TENEMOS DELIVERY. Todo pedido se retira por el local.
+    
+    REGLA DE PRECIOS: Si mencionas $, pon al lado los Bs.
     
     CLIENTE: {nombre_real}
     CARRITO: {carrito_txt}
     HISTORIAL: {historial_chat}
     
-    ACCIONES (Usa EXACTAMENTE este formato):
+    ACCIONES:
     1. Nuevo -> [NOMBRE: nombre]
     2. Agrega -> [AGENDAR: Resumen | Monto USD]
     3. Cancela -> [CANCELAR]
-    4. Dirección -> [DIRECCION: dirección completa] (¡OBLIGATORIO si el usuario da su ubicación!)
+    4. SI EL CLIENTE CONFIRMA, DICE "OK", "LO QUIERO" O PREGUNTA CÓMO PAGAR -> [FINALIZAR] (Esto cierra la venta para retiro).
     """
     
     resp_ia = consultar_ia(prompt, mensaje)
-    print(f"🤖 IA RAW: {resp_ia}") # Debug en logs
+    print(f"🤖 IA RAW: {resp_ia}")
 
-    # --- PROCESAMIENTO INTELIGENTE ---
+    # --- ACCIONES ---
     msg_to_user = "" 
 
-    # 1. Extraer Nombre
-    nombre_tag = extraer_tag("NOMBRE", resp_ia)
-    if nombre_tag:
-        cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (nombre_tag, telefono))
-
-    # 2. Extraer Pedido
-    agenda_tag = extraer_tag("AGENDAR", resp_ia)
-    if agenda_tag:
-        try:
-            d = agenda_tag.split("|")
-            resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
-            if pedido: cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
-            else: cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
-        except: pass
-
-    # 3. Cancelar
-    if "[CANCELAR]" in resp_ia.upper():
-        cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
-
-    # 4. Dirección (CRÍTICO: Usa Regex para detectar variaciones)
-    direccion_tag = extraer_tag("DIRECCION", resp_ia) or extraer_tag("DIRECCIÓN", resp_ia)
-    
-    if direccion_tag:
-        # Guardar en DB
-        cur.execute("UPDATE pedidos SET direccion=%s, estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (direccion_tag, telefono))
+    if "[NOMBRE:" in resp_ia:
+        n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
+        cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
         
-        # Calcular Totales
+    if "[AGENDAR:" in resp_ia:
+        d = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
+        resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
+        if pedido: cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
+        else: cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
+        
+    if "[CANCELAR]" in resp_ia:
+        cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
+        
+    # 🔥 ACCIÓN DE CIERRE SIMPLIFICADA (SIN DIRECCIÓN)
+    if "[FINALIZAR]" in resp_ia:
+        # Guardamos "Retiro en Tienda" automáticamente
+        cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
+        
         monto_usd = pedido['monto_total'] if pedido else 0
         monto_bs = monto_usd * tasas['usd']
         
-        # MENSAJE FORZADO (Evita silencio)
-        msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📍 Dirección: {direccion_tag}\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Datos de Pago:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n\n📸 *Envía foto del pago para despachar.*"
+        # Mensaje de Cierre
+        msg_to_user = f"✅ *¡Pedido Confirmado para Retirar!*\n\n💵 Total: ${monto_usd:.2f} ({monto_bs:.2f} Bs)\n\n📲 *Datos de Pago:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n\n📍 *Te esperamos en el local para entregarte.*\n📸 Envía foto del pago para preparar tu pedido."
         
         if ADMIN_PHONE_CLEAN:
-            try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO\nCliente: {nombre_real}\nDir: {direccion_tag}\nTotal: {monto_bs:.2f} Bs")
+            try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO (RETIRO)\nCliente: {nombre_real}\nTotal: {monto_bs:.2f} Bs")
             except: pass
 
     conn.commit(); conn.close()
     
-    # RESPUESTA FINAL
+    # RESPUESTA
     if msg_to_user:
         enviar_whatsapp(telefono, msg_to_user)
         guardar_mensaje(telefono, 'assistant', msg_to_user)
     else:
-        # Limpiar tags y enviar solo si queda texto
         clean_resp = re.sub(r'\[.*?\]', '', resp_ia).strip()
         if clean_resp:
             enviar_whatsapp(telefono, clean_resp)
@@ -268,7 +255,9 @@ def webhook():
         if (not res_bot or res_bot['value'] == 'false') and num != ADMIN_PHONE_CLEAN: return "OK", 200
 
         if msg['type'] == 'image': threading.Thread(target=procesar_pago, args=(msg['image']['id'], num)).start(); return "OK", 200
-        if msg['type'] == 'location': txt = f"GPS: http://maps.google.com/?q={msg['location']['latitude']},{msg['location']['longitude']}"
+        
+        # 🚨 IGNORAMOS UBICACIONES PARA EVITAR PROBLEMAS
+        if msg['type'] == 'location': return "OK", 200 
 
         if num in user_buffers: user_buffers[num]['timer'].cancel(); user_buffers[num]['text'] += f" {txt}"
         else: user_buffers[num] = {'text': txt}
