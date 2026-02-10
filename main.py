@@ -13,17 +13,14 @@ META_PHONE_ID = os.environ.get("META_PHONE_ID")
 ADMIN_PHONE = str(os.environ.get("ADMIN_PHONE")).replace("+", "").replace(" ", "").strip()
 MODELO_IA = "google/gemini-2.5-flash"
 
-# --- MEMORIA VOLÁTIL ---
-user_buffers = {}   # Buffer para el delay de 5s
-procesados = set()  # Anti-spam de Meta
+user_buffers = {}
+procesados = set()
 cache_tasas = {"usd": 0.0, "eur": 0.0, "expira": 0}
 
-# --- CONEXIÓN DB ---
 def get_db():
     try: return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     except Exception as e: print(f"❌ Error DB: {e}"); return None
 
-# --- WHATSAPP SEND ---
 def enviar_whatsapp(to, body):
     try:
         url = f"https://graph.facebook.com/v17.0/{META_PHONE_ID}/messages"
@@ -31,18 +28,15 @@ def enviar_whatsapp(to, body):
         requests.post(url, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}}, headers=headers, timeout=5)
     except: pass
 
-# --- TASAS AUTOMÁTICAS ---
 def obtener_tasas():
     global cache_tasas
     if time.time() < cache_tasas["expira"]: return cache_tasas
-
     t_usd, t_eur = 0.0, 0.0
     try:
         res_u = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=4).json()
         t_usd = float(res_u['rates']['VES'])
         res_e = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=4).json()
         t_eur = float(res_e['rates']['VES'])
-        
         conn = get_db()
         if conn:
             cur = conn.cursor()
@@ -59,23 +53,18 @@ def obtener_tasas():
                 if r['key'] == 'tasa_usd': t_usd = float(r['value'])
                 if r['key'] == 'tasa_eur': t_eur = float(r['value'])
             conn.close()
-
     cache_tasas = {"usd": t_usd, "eur": t_eur, "expira": time.time() + 3600}
     return cache_tasas
 
-# --- PROCESAMIENTO PAGOS ---
 def procesar_pago(image_id, cliente_id):
     try:
-        # 1. Descargar
         url_get = f"https://graph.facebook.com/v17.0/{image_id}"
         headers = {"Authorization": f"Bearer {META_TOKEN}"}
         res_url = requests.get(url_get, headers=headers).json().get('url')
         if not res_url: return
-
         img_data = requests.get(res_url, headers=headers).content
         b64_img = base64.b64encode(img_data).decode('utf-8')
 
-        # 2. IA Visión
         url_ai = "https://openrouter.ai/api/v1/chat/completions"
         payload = {
             "model": "google/gemini-2.0-flash-001",
@@ -95,25 +84,18 @@ def procesar_pago(image_id, cliente_id):
             return
 
         conn = get_db(); cur = conn.cursor()
-
-        # 3. Antifraude (Duplicados)
         cur.execute("SELECT id FROM pagos WHERE referencia = %s", (str(datos['ref']),))
         if cur.fetchone():
             enviar_whatsapp(cliente_id, f"❌ ERROR: La referencia {datos['ref']} ya existe.")
             conn.close(); return
 
-        # 4. Registrar
         cur.execute("INSERT INTO pagos (cliente_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (cliente_id, str(datos['ref']), datos['monto']))
         conn.commit()
-
         enviar_whatsapp(cliente_id, f"✅ Pago registrado (Ref: {datos['ref']}). Esperando aprobación.")
         enviar_whatsapp(ADMIN_PHONE, f"💰 *PAGO PENDIENTE*\nCliente: {cliente_id}\nRef: {datos['ref']}\nMonto: {datos['monto']} Bs\nResponde 'Sí' para aprobar.")
         conn.close()
+    except Exception as e: print(f"Error Pago: {e}")
 
-    except Exception as e:
-        print(f"Error Pago: {e}")
-
-# --- CEREBRO IA ---
 def consultar_ia(prompt_sistema, entrada):
     try:
         url = "https://openrouter.ai/api/v1/chat/completions"
@@ -127,10 +109,8 @@ def consultar_ia(prompt_sistema, entrada):
         return res.json()['choices'][0]['message']['content']
     except: return "Error técnico en IA."
 
-# --- PROCESO CLIENTE ---
 def procesar_cliente(telefono, nombre_wa, mensaje_acumulado):
     conn = get_db(); cur = conn.cursor()
-    
     cur.execute("SELECT nombre FROM clientes WHERE telefono = %s", (telefono,))
     res = cur.fetchone()
     if not res:
@@ -179,14 +159,12 @@ def procesar_cliente(telefono, nombre_wa, mensaje_acumulado):
         enviar_whatsapp(ADMIN_PHONE, f"🚨 CONFIRMADO\nCliente: {nombre_real}\nDir: {d}\nTotal: {bs_total:.2f} Bs")
 
     conn.commit(); conn.close()
-    
     clean = re.sub(r'\[.*?\]', '', resp_ia).strip()
     if clean: enviar_whatsapp(telefono, clean)
 
-# --- WEBHOOK (Ruta Corregida) ---
-@app.route("/whatsapp", methods=["POST", "GET"]) # ⚠️ AQUÍ ESTABA EL ERROR 404
+@app.route("/whatsapp", methods=["POST", "GET"])
 def webhook():
-    if request.method == 'GET': return request.args.get("hub.challenge"), 200 # Verificación Meta
+    if request.method == 'GET': return request.args.get("hub.challenge"), 200
 
     try:
         data = request.json['entry'][0]['changes'][0]['value']
@@ -198,30 +176,19 @@ def webhook():
 
         # --- ADMIN ---
         if num == ADMIN_PHONE:
-            if any(x in txt for x in ["sí", "si", "confirmado", "aprobado"]):
-                conn=get_db(); cur=conn.cursor()
-                cur.execute("SELECT id, cliente_id, monto FROM pagos WHERE estado='pendiente' ORDER BY id DESC LIMIT 1")
-                pago = cur.fetchone()
-                if pago:
-                    cur.execute("UPDATE pagos SET estado='aprobado' WHERE id=%s", (pago['id'],))
-                    conn.commit()
-                    enviar_whatsapp(num, "✅ Aprobado.")
-                    enviar_whatsapp(pago['cliente_id'], "🎉 Pago confirmado. Pedido en marcha.")
-                conn.close()
-                return "OK", 200
-
-            if "activar prueba" in txt:
+            # 1. Comandos Flexibles
+            if "activar" in txt and "prueba" in txt:
                 conn=get_db(); cur=conn.cursor()
                 cur.execute("UPDATE config SET value='true' WHERE key='test_mode'")
                 conn.commit(); conn.close()
-                enviar_whatsapp(num, "🧪 TEST ON")
+                enviar_whatsapp(num, "🧪 TEST ON (Ahora eres cliente, aunque el bot esté apagado)")
                 return "OK", 200
             
-            if "desactivar prueba" in txt:
+            if "desactivar" in txt and "prueba" in txt:
                 conn=get_db(); cur=conn.cursor()
                 cur.execute("UPDATE config SET value='false' WHERE key='test_mode'")
                 conn.commit(); conn.close()
-                enviar_whatsapp(num, "✅ TEST OFF")
+                enviar_whatsapp(num, "✅ TEST OFF (Eres Admin)")
                 return "OK", 200
 
             if "apagar bot" in txt:
@@ -238,18 +205,39 @@ def webhook():
                 enviar_whatsapp(num, "🟢 Bot ON")
                 return "OK", 200
             
+            if any(x in txt for x in ["sí", "si", "confirmado", "aprobado"]):
+                conn=get_db(); cur=conn.cursor()
+                cur.execute("SELECT id, cliente_id, monto FROM pagos WHERE estado='pendiente' ORDER BY id DESC LIMIT 1")
+                pago = cur.fetchone()
+                if pago:
+                    cur.execute("UPDATE pagos SET estado='aprobado' WHERE id=%s", (pago['id'],))
+                    conn.commit()
+                    enviar_whatsapp(num, "✅ Aprobado.")
+                    enviar_whatsapp(pago['cliente_id'], "🎉 Pago confirmado. Pedido en marcha.")
+                conn.close()
+                return "OK", 200
+
+            # Verificar si Admin está en test
             conn=get_db(); cur=conn.cursor()
             cur.execute("SELECT value FROM config WHERE key='test_mode'")
             res_test = cur.fetchone()
             conn.close()
+            
+            # Si NO está en modo prueba, salir (ignorar)
             if not res_test or res_test['value'] == 'false': return "OK", 200
 
-        # --- CLIENTE ---
+        # --- CLIENTE (O ADMIN EN PRUEBA) ---
         conn=get_db(); cur=conn.cursor()
         cur.execute("SELECT value FROM config WHERE key='bot_activo'")
         res_bot = cur.fetchone()
         conn.close()
-        if not res_bot or res_bot['value'] == 'false': return "OK", 200
+        
+        # ⚠️ CORRECCIÓN CLAVE: Si es Admin en Prueba, IGNORAMOS que el bot esté apagado
+        bot_esta_prendido = res_bot and res_bot['value'] == 'true'
+        es_admin_en_prueba = (num == ADMIN_PHONE)
+        
+        if not bot_esta_prendido and not es_admin_en_prueba: 
+            return "OK", 200 # Si está apagado y NO eres admin probando, adiós.
 
         if msg['type'] == 'image':
             threading.Thread(target=procesar_pago, args=(msg['image']['id'], num)).start()
