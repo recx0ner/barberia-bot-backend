@@ -147,22 +147,20 @@ def procesar_pago(image_id, cliente_id):
             restante = total_pedido_bs - total_pagado
             
             if restante > 1.0:
-                mensaje_cliente += f"\n\n📉 *Abonado:* {total_pagado:,.2f} Bs\n⚠️ *Faltan:* {restante:,.2f} Bs\n(Tu pedido sigue Pendiente de Pago)"
+                mensaje_cliente += f"\n\n📉 *Abonado:* {total_pagado:,.2f} Bs\n⚠️ *Faltan:* {restante:,.2f} Bs"
                 msg_admin_extra = f"\n⚠️ Incompleto. Restan: {restante:,.2f} Bs"
             else:
-                # CONFIRMACIÓN AUTOMÁTICA
                 cur.execute("SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago') LIMIT 1", (cliente_id,))
                 pid = cur.fetchone()
                 if pid:
                     cur.execute("UPDATE pedidos SET estado='confirmado' WHERE id=%s", (pid['id'],))
                     conn.commit()
-                
                 mensaje_cliente += "\n\n🎉 *¡PAGO COMPLETADO!*\nTu pedido ha pasado a estado: *CONFIRMADO*."
-                msg_admin_extra = "\n✅ PAGADO TOTALMENTE. DESPACHAR."
+                msg_admin_extra = "\n✅ PAGADO TOTALMENTE."
         
         enviar_whatsapp(cliente_id, mensaje_cliente)
         if ADMIN_PHONE_CLEAN:
-            enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *PAGO NUEVO*\nRef: {ref_real}\nMonto: {monto_real:,.2f} Bs{msg_admin_extra}\nResponde 'Sí' para aprobar el dinero.")
+            enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *PAGO NUEVO*\nRef: {ref_real}\nMonto: {monto_real:,.2f} Bs{msg_admin_extra}\nResponde 'Sí' para aprobar.")
 
     except Exception as e: print(f"Error Pago: {e}")
     finally: release_db_connection(conn)
@@ -188,7 +186,6 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     try:
         cur = conn.cursor()
         
-        # Identidad
         cur.execute("SELECT nombre FROM clientes WHERE telefono = %s", (telefono,))
         res = cur.fetchone()
         if not res:
@@ -200,7 +197,6 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         cur.execute("SELECT resumen, monto_total, estado FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago') LIMIT 1", (telefono,))
         pedido_db = cur.fetchone()
         
-        # Variables locales para manejar estado en tiempo real
         pedido_actual = {
             'resumen': pedido_db['resumen'] if pedido_db else "Vacio",
             'monto_total': float(pedido_db['monto_total']) if pedido_db else 0.0,
@@ -209,7 +205,7 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         
         historial_chat = obtener_historial(conn, telefono)
 
-        # 🔥 PROMPT "RED DE SEGURIDAD"
+        # 🔥 PROMPT "ANTI-ERROR 0$"
         prompt = f"""
         CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
         TASAS: USD={tasas['usd']} Bs.
@@ -219,15 +215,14 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         CARRITO ACTUAL (BD): {pedido_actual['resumen']} (${pedido_actual['monto_total']})
         HISTORIAL: {historial_chat}
         
-        ⚠️ INSTRUCCIONES DE EMERGENCIA:
-        1. Tu trabajo principal es REGISTRAR. Si el cliente pide algo (ej: "2 pepperonis"), DEBES usar [AGENDAR].
-           Si no usas la etiqueta, el cliente recibirá una factura de $0 y se molestará.
+        ⚠️ OBLIGATORIO: CALCULAR PRECIO.
+        Si el cliente pide "2 pizzas de $10", el total es $20.
+        TU RESPUESTA DEBE INCLUIR LA ETIQUETA CORRECTA CON EL TOTAL CALCULADO.
+        Ejemplo: [AGENDAR: 2 Pizzas Pepperoni | 20]  <-- ¡NO PONGAS 0!
         
-        2. CIERRE INTELIGENTE (RED DE SEGURIDAD):
-           Si el cliente dice "LISTO/SOLO ESO" y el CARRITO ACTUAL está vacío o en $0, pero en el HISTORIAL ves que pidió algo (ej: "quiero 2 pizzas"), significa que OLVIDASTE agendarlo antes.
-           -> EN ESE CASO: Usa [AGENDAR: ...] Y [FINALIZAR] en el mismo mensaje.
-           
-        3. Si el carrito ya tiene datos correctos y dice "LISTO", solo usa [FINALIZAR].
+        REGLA DE ORO:
+        Si el cliente dice "SOLO ESO" o "DAME DOS PEPPERONI Y YA":
+        -> Usa [AGENDAR: ... | Total] Y [FINALIZAR] en el mismo mensaje.
         """
         
         resp_ia = consultar_ia(prompt, mensaje)
@@ -238,31 +233,50 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
             n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
             cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
             
-        # PROCESAR AGENDAR (Primero, para que si finaliza use el dato nuevo)
         if "[AGENDAR:" in resp_ia:
             try:
-                d = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
-                resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
+                # 1. Intentamos leer la etiqueta normal
+                tag_content = resp_ia.split("[AGENDAR:")[1].split("]")[0]
+                d = tag_content.split("|")
+                resum = d[0].strip()
                 
+                # Intentamos sacar el monto de la etiqueta
+                m = float(d[1].strip()) if len(d)>1 else 0.0
+                
+                # 🚨 SALVAVIDAS: Si el monto es 0, buscamos un signo $ en el texto del mensaje
+                if m == 0:
+                    print("⚠️ ALERTA: IA envió monto 0. Buscando precio en texto...")
+                    # Regex busca $10, $ 20, 20$
+                    match = re.search(r'\$\s?(\d+(?:\.\d+)?)', resp_ia)
+                    if match:
+                        m = float(match.group(1))
+                        print(f"✅ CORREGIDO: Monto encontrado en texto -> {m}")
+
                 if pedido_actual['existe']:
                     cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago') LIMIT 1)", (resum, m, telefono))
                 else: 
                     cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total, estado) VALUES (%s, %s, %s, 'carrito')", (telefono, resum, m))
                     pedido_actual['existe'] = True
                 
-                # ⚠️ ACTUALIZAMOS LA MEMORIA LOCAL PARA EL FINALIZAR
                 pedido_actual['resumen'] = resum
                 pedido_actual['monto_total'] = m
-            except: pass
+            except Exception as e: print(f"Error Agendando: {e}")
         
         if "[CANCELAR]" in resp_ia:
             cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago')", (telefono,))
             pedido_actual['monto_total'] = 0
             
         if "[FINALIZAR]" in resp_ia:
-            # Ahora sí, leemos el monto actualizado (sea de DB o del [AGENDAR] que acaba de pasar)
             monto_usd = pedido_actual['monto_total']
             
+            # Si a pesar de todo es 0, intentamos un último escaneo desesperado
+            if monto_usd == 0:
+                 match = re.search(r'\$\s?(\d+(?:\.\d+)?)', resp_ia)
+                 if match: 
+                     monto_usd = float(match.group(1))
+                     # Guardamos este rescate final
+                     cur.execute("UPDATE pedidos SET monto_total=%s WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago')", (monto_usd, telefono))
+
             if monto_usd > 0:
                 cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='pendiente_pago' WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago')", (telefono,))
                 
@@ -275,8 +289,7 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
                     try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"⏳ NUEVA ORDEN (Pendiente Pago)\nCliente: {nombre_real}\nTotal: {monto_bs:,.2f} Bs")
                     except: pass
             else:
-                # Si llega aquí y sigue siendo 0, es un error grave. Avisamos.
-                msg_to_user = "⚠️ *Error:* No detecté productos en tu carrito. Por favor repite tu pedido (ej: 'Quiero una pizza de...') para poder generarte el recibo."
+                msg_to_user = "⚠️ *Error Técnico:* La IA entendió tu pedido pero olvidó anotar el precio. Por favor escribe: *'El total son 20 dólares'* para corregirlo manualmente."
 
         conn.commit()
         
