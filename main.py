@@ -30,7 +30,7 @@ MODELO_IA = "google/gemini-2.5-flash"
 user_buffers = {}
 cache_tasas = {"usd": 0.0, "eur": 0.0, "expira": 0}
 
-# --- POOL DE CONEXIONES (VELOCIDAD) ---
+# --- POOL DB ---
 try:
     pg_pool = psycopg2.pool.SimpleConnectionPool(1, 20, CONFIG["DATABASE_URL"], cursor_factory=RealDictCursor)
 except: pg_pool = None
@@ -53,7 +53,7 @@ def enviar_whatsapp(to, body):
         requests.post(url, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}}, headers=headers, timeout=5)
     except Exception as e: print(f"Error WA: {e}")
 
-# --- MEMORIA (HISTORIAL) ---
+# --- MEMORIA ---
 def obtener_historial(conn, cliente_id):
     cur = conn.cursor()
     cur.execute("SELECT role, content FROM messages WHERE cliente_id = %s ORDER BY id DESC LIMIT 6", (cliente_id,))
@@ -88,7 +88,7 @@ def limpiar_monto_bs(valor_raw):
         return float(v)
     except: return 0.0
 
-# --- PAGOS ---
+# --- PAGOS (CEREBRO FINANCIERO) ---
 def procesar_pago(image_id, cliente_id):
     conn = get_db_connection()
     if not conn: return
@@ -128,14 +128,18 @@ def procesar_pago(image_id, cliente_id):
             enviar_whatsapp(cliente_id, f"❌ ERROR: Referencia {ref_real} DUPLICADA.")
             return
 
+        # Registrar Pago
         cur.execute("INSERT INTO pagos (cliente_id, referencia, monto, estado) VALUES (%s, %s, %s, 'pendiente')", (cliente_id, ref_real, monto_real))
         conn.commit()
 
+        # --- LÓGICA DE ESTADOS DEL PEDIDO ---
         tasas = obtener_tasas()
-        cur.execute("SELECT monto_total FROM pedidos WHERE cliente_id = %s AND estado IN ('carrito', 'confirmado') LIMIT 1", (cliente_id,))
+        
+        # Buscamos pedidos activos (carrito o pendiente_pago)
+        cur.execute("SELECT id, monto_total FROM pedidos WHERE cliente_id = %s AND estado IN ('carrito', 'pendiente_pago', 'confirmado') ORDER BY id DESC LIMIT 1", (cliente_id,))
         pedido = cur.fetchone()
         
-        mensaje_cliente = f"✅ *Pago Registrado*\n🔖 Ref: {ref_real}\n💵 Monto: {monto_real:,.2f} Bs"
+        mensaje_cliente = f"✅ *Pago Recibido*\n🔖 Ref: {ref_real}\n💵 Monto: {monto_real:,.2f} Bs"
         msg_admin_extra = ""
 
         if pedido:
@@ -143,18 +147,23 @@ def procesar_pago(image_id, cliente_id):
             cur.execute("SELECT SUM(monto) as pagado FROM pagos WHERE cliente_id = %s AND estado IN ('pendiente', 'aprobado')", (cliente_id,))
             res_pagos = cur.fetchone()
             total_pagado = float(res_pagos['pagado']) if res_pagos and res_pagos['pagado'] else 0.0
+            
             restante = total_pedido_bs - total_pagado
             
             if restante > 1.0:
-                mensaje_cliente += f"\n\n📉 *Abonado:* {total_pagado:,.2f} Bs\n⚠️ *Resta:* {restante:,.2f} Bs"
-                msg_admin_extra = f"\n⚠️ Debe: {restante:,.2f} Bs"
+                mensaje_cliente += f"\n\n📉 *Abonado:* {total_pagado:,.2f} Bs\n⚠️ *Faltan:* {restante:,.2f} Bs\n(Tu pedido sigue como 'Pendiente por Pagar')"
+                msg_admin_extra = f"\n⚠️ Incompleto. Restan: {restante:,.2f} Bs"
             else:
-                mensaje_cliente += "\n\n🎉 *¡Pagado Completo!*"
-                msg_admin_extra = "\n✅ Pagado 100%"
+                # 🏆 AQUÍ OCURRE LA MAGIA: CAMBIO A CONFIRMADO AUTOMÁTICO
+                cur.execute("UPDATE pedidos SET estado='confirmado' WHERE id=%s", (pedido['id'],))
+                conn.commit()
+                
+                mensaje_cliente += "\n\n🎉 *¡PAGO COMPLETADO!*\nTu pedido ha pasado a estado: *CONFIRMADO*.\nYa estamos preparándolo."
+                msg_admin_extra = "\n✅ PAGADO TOTALMENTE. PROCEDER A DESPACHO."
         
         enviar_whatsapp(cliente_id, mensaje_cliente)
         if ADMIN_PHONE_CLEAN:
-            enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *PAGO NUEVO*\nRef: {ref_real}\nMonto: {monto_real:,.2f} Bs{msg_admin_extra}\nResponde 'Sí' para aprobar.")
+            enviar_whatsapp(ADMIN_PHONE_CLEAN, f"💰 *PAGO NUEVO*\nRef: {ref_real}\nMonto: {monto_real:,.2f} Bs{msg_admin_extra}\nResponde 'Sí' para aprobar el dinero en banco.")
 
     except Exception as e: print(f"Error Pago: {e}")
     finally: release_db_connection(conn)
@@ -180,94 +189,77 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     try:
         cur = conn.cursor()
         
-        # 1. IDENTIFICACIÓN Y REGISTRO (LA MEMORIA)
+        # Identidad
         cur.execute("SELECT nombre FROM clientes WHERE telefono = %s", (telefono,))
         res = cur.fetchone()
         if not res:
-            # Si no existe, lo creamos como "Nuevo"
             cur.execute("INSERT INTO clientes (telefono, nombre) VALUES (%s, %s)", (telefono, nombre_wa))
             conn.commit(); nombre_real = "Nuevo"
-        else:
-            # Si existe, recuperamos su nombre real
-            nombre_real = res['nombre']
+        else: nombre_real = res['nombre']
 
         tasas = obtener_tasas()
-        cur.execute("SELECT resumen, monto_total FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1", (telefono,))
+        # Buscamos pedido activo
+        cur.execute("SELECT resumen, monto_total, estado FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago') LIMIT 1", (telefono,))
         pedido = cur.fetchone()
-        carrito_txt = f"Carrito: {pedido['resumen']} (${pedido['monto_total']})" if pedido else "Vacio"
+        carrito_txt = f"Carrito ({pedido['estado']}): {pedido['resumen']} (${pedido['monto_total']})" if pedido else "Vacio"
         
         historial_chat = obtener_historial(conn, telefono)
 
-        # 🔥 PROMPT "IDENTIDAD + CIERRE DIRECTO"
+        # 🔥 PROMPT "SIN REDUNDANCIA"
         prompt = f"""
         CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
         TASAS: USD={tasas['usd']} Bs.
+        POLITICA: Retiro en Tienda.
         
-        CLIENTE ACTUAL: {nombre_real}
-        (Si el nombre es 'Nuevo', tu ÚNICA prioridad es preguntarle su nombre amablemente).
-        
+        CLIENTE: {nombre_real}
         CARRITO: {carrito_txt}
-        HISTORIAL RECIENTE: {historial_chat}
+        HISTORIAL: {historial_chat}
         
-        INSTRUCCIONES DE ACCIÓN:
-        1. NUEVO CLIENTE: Si {nombre_real} es 'Nuevo', responde saludando y pidiendo el nombre.
-           -> Cuando te de el nombre, usa la etiqueta [NOMBRE: ...]
-           
-        2. PEDIDOS: Si el cliente pide algo, responde confirmando y usa [AGENDAR].
-           -> "Anotada la Margarita. [AGENDAR: Pizza Margarita | 8]"
+        INSTRUCCIONES DE COMPORTAMIENTO:
+        1. [AGENDAR]: Si pide algo, agéndalo de una vez. No preguntes.
         
-        3. CIERRE RÁPIDO: Si el cliente dice "SOLO ESO", "NADA MÁS", "LISTO", "OK":
-           -> Asume que quiere pagar.
-           -> Usa la etiqueta [FINALIZAR].
-           -> NO preguntes "¿Te confirmo?". Cierra la venta.
+        2. [FINALIZAR]: Si el cliente dice "SOLO ESO", "NADA MÁS", "LISTO", "OK", "SI", "YA":
+           -> ¡CIERRA LA VENTA INMEDIATAMENTE!
+           -> NO preguntes "¿Te confirmo?". Asume el SÍ.
+           -> Dispara la etiqueta [FINALIZAR].
            
-        ETIQUETAS TÉCNICAS DISPONIBLES:
-        [NOMBRE: NombreExtraido]
-        [AGENDAR: Resumen | Monto USD]
-        [CANCELAR]
-        [FINALIZAR]
+        3. Si pregunta cuenta, dispar [FINALIZAR].
         """
         
         resp_ia = consultar_ia(prompt, mensaje)
         
-        # --- PROCESAR ETIQUETAS ---
         msg_to_user = "" 
 
-        # A. Actualización de Nombre (Persistencia)
         if "[NOMBRE:" in resp_ia:
             n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
             cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
-            # Opcional: Actualizar variable local para logs
-            nombre_real = n
             
-        # B. Agendar Pedido
         if "[AGENDAR:" in resp_ia:
             d = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
             resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
             if pedido: 
-                cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1)", (resum, m, telefono))
+                cur.execute("UPDATE pedidos SET resumen=%s, monto_total=%s WHERE id=(SELECT id FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago') LIMIT 1)", (resum, m, telefono))
                 pedido = {'resumen': resum, 'monto_total': m} 
             else: 
-                cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
+                cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total, estado) VALUES (%s, %s, %s, 'carrito')", (telefono, resum, m))
                 pedido = {'resumen': resum, 'monto_total': m}
         
-        # C. Cancelar
         if "[CANCELAR]" in resp_ia:
-            cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
+            cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago')", (telefono,))
             
-        # D. Finalizar Venta (Cierre)
         if "[FINALIZAR]" in resp_ia:
-            cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
+            # 1. CAMBIO DE ESTADO A 'PENDIENTE POR PAGAR' (No confirmado aún)
+            cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='pendiente_pago' WHERE cliente_id=%s AND estado IN ('carrito','pendiente_pago')", (telefono,))
             
             monto_usd = float(pedido['monto_total']) if pedido else 0.0
             resumen_final = pedido['resumen'] if pedido else "Varios"
             monto_bs = monto_usd * tasas['usd']
             
-            # Recibo Final
-            msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📝 {resumen_final}\n💵 Total: ${monto_usd:.2f} ({monto_bs:,.2f} Bs)\n\n📍 *Retiro en Tienda.*\n📲 *Pago Móvil:* 0412-1234567 | V-12345678 | Banco Venezuela\n\n📸 *Envía el comprobante para apartar tu pedido.*"
+            # 2. MENSAJE DE COBRO
+            msg_to_user = f"📝 *Pedido Generado*\n\n{resumen_final}\n💵 Total a Pagar: ${monto_usd:.2f} ({monto_bs:,.2f} Bs)\n\n⚠️ *Estado: Pendiente por Pagar*\n\n📲 *Datos para Transferir:*\n- Pago Móvil: 0412-1234567\n- Banco: Venezuela\n- RIF: V-12345678\n\n📸 *Espera tu confirmación tras enviar el pago.*"
             
             if ADMIN_PHONE_CLEAN:
-                try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"🚨 NUEVO PEDIDO\nCliente: {nombre_real}\nTotal: {monto_bs:,.2f} Bs")
+                try: enviar_whatsapp(ADMIN_PHONE_CLEAN, f"⏳ NUEVA ORDEN (Pendiente Pago)\nCliente: {nombre_real}\nTotal: {monto_bs:,.2f} Bs")
                 except: pass
 
         conn.commit()
@@ -296,7 +288,7 @@ def webhook():
         nombre = data['contacts'][0]['profile']['name']
 
         if num == ADMIN_PHONE_CLEAN:
-            # Admin Lógica
+            # Comandos Admin
             if "activar" in txt and "prueba" in txt:
                 conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE config SET value='true' WHERE key='test_mode'"); conn.commit(); release_db_connection(conn)
                 enviar_whatsapp(num, "🧪 TEST ON"); return "OK", 200
