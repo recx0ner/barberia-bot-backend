@@ -30,7 +30,7 @@ MODELO_IA = "google/gemini-2.5-flash"
 user_buffers = {}
 cache_tasas = {"usd": 0.0, "eur": 0.0, "expira": 0}
 
-# --- POOL DB ---
+# --- POOL DE CONEXIONES (VELOCIDAD) ---
 try:
     pg_pool = psycopg2.pool.SimpleConnectionPool(1, 20, CONFIG["DATABASE_URL"], cursor_factory=RealDictCursor)
 except: pg_pool = None
@@ -53,7 +53,7 @@ def enviar_whatsapp(to, body):
         requests.post(url, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": body}}, headers=headers, timeout=5)
     except Exception as e: print(f"Error WA: {e}")
 
-# --- MEMORIA ---
+# --- MEMORIA (HISTORIAL) ---
 def obtener_historial(conn, cliente_id):
     cur = conn.cursor()
     cur.execute("SELECT role, content FROM messages WHERE cliente_id = %s ORDER BY id DESC LIMIT 6", (cliente_id,))
@@ -179,12 +179,17 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
     if not conn: return
     try:
         cur = conn.cursor()
+        
+        # 1. IDENTIFICACIÓN Y REGISTRO (LA MEMORIA)
         cur.execute("SELECT nombre FROM clientes WHERE telefono = %s", (telefono,))
         res = cur.fetchone()
         if not res:
+            # Si no existe, lo creamos como "Nuevo"
             cur.execute("INSERT INTO clientes (telefono, nombre) VALUES (%s, %s)", (telefono, nombre_wa))
             conn.commit(); nombre_real = "Nuevo"
-        else: nombre_real = res['nombre']
+        else:
+            # Si existe, recuperamos su nombre real
+            nombre_real = res['nombre']
 
         tasas = obtener_tasas()
         cur.execute("SELECT resumen, monto_total FROM pedidos WHERE cliente_id=%s AND estado IN ('carrito','confirmado') LIMIT 1", (telefono,))
@@ -193,28 +198,34 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         
         historial_chat = obtener_historial(conn, telefono)
 
-        # 🔥 PROMPT "CIERRE DIRECTO"
+        # 🔥 PROMPT "IDENTIDAD + CIERRE DIRECTO"
         prompt = f"""
         CONTEXTO: {CONFIG['BUSINESS_CONTEXT']}
         TASAS: USD={tasas['usd']} Bs.
         
-        CLIENTE: {nombre_real}
+        CLIENTE ACTUAL: {nombre_real}
+        (Si el nombre es 'Nuevo', tu ÚNICA prioridad es preguntarle su nombre amablemente).
+        
         CARRITO: {carrito_txt}
-        HISTORIAL: {historial_chat}
+        HISTORIAL RECIENTE: {historial_chat}
         
-        INSTRUCCIONES DE COMPORTAMIENTO:
-        1. Si el cliente dice qué quiere (ej: "Una pepperoni"), DEBES usar la etiqueta [AGENDAR] en ese mismo mensaje. ¡NO ESPERES A CONFIRMAR!
-           Correcto: "¡Listo! Agendo tu Pepperoni por $10. [AGENDAR: Pizza Pepperoni | 10]"
+        INSTRUCCIONES DE ACCIÓN:
+        1. NUEVO CLIENTE: Si {nombre_real} es 'Nuevo', responde saludando y pidiendo el nombre.
+           -> Cuando te de el nombre, usa la etiqueta [NOMBRE: ...]
+           
+        2. PEDIDOS: Si el cliente pide algo, responde confirmando y usa [AGENDAR].
+           -> "Anotada la Margarita. [AGENDAR: Pizza Margarita | 8]"
         
-        2. Si el cliente dice "SOLO ESO", "NADA MÁS", "LISTO", "OK", "SI":
-           -> USA LA ETIQUETA [FINALIZAR] DE INMEDIATO.
-           -> NO preguntes "¿Te confirmo?". Asume que ya confirmó y cierra la venta.
-        
-        ACCIONES TÉCNICAS:
-        - [NOMBRE: ...]
-        - [AGENDAR: Resumen | Monto USD]
-        - [CANCELAR]
-        - [FINALIZAR] (Para cerrar venta y mostrar recibo).
+        3. CIERRE RÁPIDO: Si el cliente dice "SOLO ESO", "NADA MÁS", "LISTO", "OK":
+           -> Asume que quiere pagar.
+           -> Usa la etiqueta [FINALIZAR].
+           -> NO preguntes "¿Te confirmo?". Cierra la venta.
+           
+        ETIQUETAS TÉCNICAS DISPONIBLES:
+        [NOMBRE: NombreExtraido]
+        [AGENDAR: Resumen | Monto USD]
+        [CANCELAR]
+        [FINALIZAR]
         """
         
         resp_ia = consultar_ia(prompt, mensaje)
@@ -222,10 +233,14 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
         # --- PROCESAR ETIQUETAS ---
         msg_to_user = "" 
 
+        # A. Actualización de Nombre (Persistencia)
         if "[NOMBRE:" in resp_ia:
             n = resp_ia.split("[NOMBRE:")[1].split("]")[0].strip()
             cur.execute("UPDATE clientes SET nombre=%s WHERE telefono=%s", (n, telefono))
+            # Opcional: Actualizar variable local para logs
+            nombre_real = n
             
+        # B. Agendar Pedido
         if "[AGENDAR:" in resp_ia:
             d = resp_ia.split("[AGENDAR:")[1].split("]")[0].split("|")
             resum = d[0].strip(); m = float(d[1].strip()) if len(d)>1 else 0
@@ -236,9 +251,11 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
                 cur.execute("INSERT INTO pedidos (cliente_id, resumen, monto_total) VALUES (%s, %s, %s)", (telefono, resum, m))
                 pedido = {'resumen': resum, 'monto_total': m}
         
+        # C. Cancelar
         if "[CANCELAR]" in resp_ia:
             cur.execute("UPDATE pedidos SET estado='cancelado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
             
+        # D. Finalizar Venta (Cierre)
         if "[FINALIZAR]" in resp_ia:
             cur.execute("UPDATE pedidos SET direccion='Retiro en Tienda', estado='confirmado' WHERE cliente_id=%s AND estado IN ('carrito','confirmado')", (telefono,))
             
@@ -246,7 +263,7 @@ def procesar_cliente(telefono, nombre_wa, mensaje):
             resumen_final = pedido['resumen'] if pedido else "Varios"
             monto_bs = monto_usd * tasas['usd']
             
-            # Recibo Final Automático
+            # Recibo Final
             msg_to_user = f"✅ *¡Pedido Confirmado!*\n\n📝 {resumen_final}\n💵 Total: ${monto_usd:.2f} ({monto_bs:,.2f} Bs)\n\n📍 *Retiro en Tienda.*\n📲 *Pago Móvil:* 0412-1234567 | V-12345678 | Banco Venezuela\n\n📸 *Envía el comprobante para apartar tu pedido.*"
             
             if ADMIN_PHONE_CLEAN:
@@ -279,6 +296,7 @@ def webhook():
         nombre = data['contacts'][0]['profile']['name']
 
         if num == ADMIN_PHONE_CLEAN:
+            # Admin Lógica
             if "activar" in txt and "prueba" in txt:
                 conn=get_db_connection(); cur=conn.cursor(); cur.execute("UPDATE config SET value='true' WHERE key='test_mode'"); conn.commit(); release_db_connection(conn)
                 enviar_whatsapp(num, "🧪 TEST ON"); return "OK", 200
@@ -307,7 +325,6 @@ def webhook():
         if (not res_bot or res_bot['value'] == 'false') and num != ADMIN_PHONE_CLEAN: return "OK", 200
 
         if msg['type'] == 'image': threading.Thread(target=procesar_pago, args=(msg['image']['id'], num)).start(); return "OK", 200
-        
         if msg['type'] == 'location': return "OK", 200 
 
         if num in user_buffers: user_buffers[num]['timer'].cancel(); user_buffers[num]['text'] += f" {txt}"
