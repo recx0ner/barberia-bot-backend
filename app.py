@@ -1,4 +1,5 @@
 import time, threading, re, base64, requests
+import os # Asegúrate de importar os
 from flask import Flask, request
 from config import Config
 from database import Database
@@ -7,15 +8,21 @@ from ia import CerebroIA
 
 app = Flask(__name__)
 
-# Iniciar DB y Tasas
+# Iniciar DB
 Database.initialize()
-user_buffers = {} # Buffer para mensajes seguidos
+user_buffers = {}
 
+# --- FUNCIÓN DE TASAS ---
 def actualizar_tasas():
+    print("🔄 Consultando Tasa BCV/Monitor...")
     try:
-        t_usd = requests.get("https://api.exchangerate-api.com/v4/latest/USD").json()['rates']['VES']
-        Config.TASA_USD = float(t_usd)
-    except: pass
+        # Intentamos obtener la tasa
+        res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=5).json()
+        tasa = float(res['rates']['VES'])
+        Config.TASA_USD = tasa
+        print(f"✅ Tasa Actualizada: {tasa} Bs/USD")
+    except Exception as e:
+        print(f"⚠️ Error obteniendo tasa (Usando {Config.TASA_USD} por defecto): {e}")
 
 def procesar_mensaje(telefono, nombre, mensaje):
     # 1. Identificar Cliente
