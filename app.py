@@ -50,7 +50,7 @@ def procesar_mensaje(telefono, nombre, mensaje):
     - Si el cliente pide un producto (nuevo o adicional), ejecuta la herramienta 'agendar_pedido'.
     - Si el cliente "confirma" su pedido, dice 'solo eso', o indica que ya terminó y quiere pagar, ejecuta la herramienta 'finalizar_pedido'.
     - Si el cliente es nuevo o cambia su nombre, ejecuta 'actualizar_nombre'.
-    - Puedes responder al usuario amablemente mientras ejecutas las herramientas.
+    - REGLA DE ORO: SIEMPRE debes incluir un mensaje de texto amable para el usuario en tu respuesta, incluso cuando llamas a una herramienta. Nunca debes dejar el texto vacío. Dile al usuario que ya agendaste su producto.
     """
 
     # 4. Consultar IA (Ahora devuelve un diccionario)
@@ -79,6 +79,9 @@ def procesar_mensaje(telefono, nombre, mensaje):
                 item = argumentos.get("item")
                 precio = float(argumentos.get("precio", 0))
                 Database.update_pedido(telefono, item, precio)
+                # Respaldo por si la IA a pesar de la orden se queda callada
+                if not texto_limpio:
+                    texto_limpio = f"✅ ¡Anotado! He agregado {item} a tu pedido. ¿Deseas algo más o confirmamos la orden?"
 
             elif nombre_funcion == "finalizar_pedido":
                 Database.cerrar_pedido(telefono)
