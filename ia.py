@@ -19,17 +19,17 @@ class CerebroIA:
                     "type": "function",
                     "function": {
                         "name": "agendar_pedido",
-                        "description": "Agrega un producto al pedido o carrito del cliente.",
+                        "description": "Actualiza el carrito de compras del cliente. IMPORTANTE: Esta función REEMPLAZA el carrito actual. Debes calcular e incluir el texto del pedido COMPLETO (lo que ya estaba + lo nuevo) y el precio TOTAL acumulado.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "item": {
                                     "type": "string",
-                                    "description": "Nombre del producto a agendar (ej. Pizza Margarita)"
+                                    "description": "Resumen completo de TODO lo que el cliente va a llevar (ej. 1 Pizza Margarita, 2 Refrescos)"
                                 },
                                 "precio": {
                                     "type": "number",
-                                    "description": "Precio total del producto según el menú"
+                                    "description": "El precio TOTAL de todos los productos en el carrito sumados"
                                 }
                             },
                             "required": ["item", "precio"]

@@ -44,13 +44,15 @@ def procesar_mensaje(telefono, nombre, mensaje):
     CARRITO: {carrito_txt}
     HISTORIAL: {historial}
     
-    INSTRUCCIONES CLAVE:
-    Eres un Agente asistente. Ya no necesitas usar etiquetas como [AGENDAR].
-    - Tienes herramientas (tools) disponibles para realizar acciones.
-    - Si el cliente pide un producto (nuevo o adicional), ejecuta la herramienta 'agendar_pedido'.
-    - Si el cliente "confirma" su pedido, dice 'solo eso', o indica que ya terminó y quiere pagar, ejecuta la herramienta 'finalizar_pedido'.
-    - Si el cliente es nuevo o cambia su nombre, ejecuta 'actualizar_nombre'.
-    - REGLA DE ORO: SIEMPRE debes incluir un mensaje de texto amable para el usuario en tu respuesta, incluso cuando llamas a una herramienta. Nunca debes dejar el texto vacío. Dile al usuario que ya agendaste su producto.
+    INSTRUCCIONES CLAVE DE COMPORTAMIENTO:
+    Eres el vendedor de la pizzería. TU OBJETIVO ES LLEVAR LA VENTA HASTA EL PAGO.
+    
+    SIGUE ESTE FLUJO ESTRICTAMENTE:
+    1. Si el cliente pide un producto: Ejecuta la herramienta 'agendar_pedido' enviando el resumen TOTAL y monto TOTAL de todo lo que ha pedido. En tu respuesta de texto, confirma lo que agregaste y PREGUNTA SIEMPRE: "¿Deseas agregar algo más o confirmamos tu orden?".
+    2. Si el cliente tiene dudas: Respóndele amablemente.
+    3. Si el cliente dice "solo eso", "es todo", "confirmo", "estoy listo": Ejecuta la herramienta 'finalizar_pedido'. En tu respuesta de texto puedes decir "Generando tu factura...".
+    
+    REGLA DE ORO: NUNCA te quedes callado. SIEMPRE debes enviar un texto al usuario. Las herramientas se ejecutan en segundo plano, pero el texto es lo que el cliente lee.
     """
 
     # 4. Consultar IA (Ahora devuelve un diccionario)
