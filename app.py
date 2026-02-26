@@ -33,7 +33,7 @@ def procesar_mensaje(telefono, nombre, mensaje):
     carrito_txt = f"{pedido['resumen']} (${pedido['monto_total']})" if pedido else "Vacio"
     historial = Database.get_historial(telefono)
     
-    # 3. Prompt (Ahora limpio)
+    # 3. Prompt (Ahora orientado a herramientas)
     prompt = f"""
     CONTEXTO: {Config.BUSINESS_CONTEXT}
     TASA: {Config.TASA_USD} Bs.
@@ -41,43 +41,53 @@ def procesar_mensaje(telefono, nombre, mensaje):
     CARRITO: {carrito_txt}
     HISTORIAL: {historial}
     
-    INSTRUCCIONES:
-    1. Si pide producto -> Usa [AGENDAR: Item | Precio]. Ej: [AGENDAR: Pizza | 10]
-    2. Si dice "SOLO ESO/LISTO" -> Usa [FINALIZAR].
-    3. Nuevo cliente -> [NOMBRE: ...]
+    INSTRUCCIONES CLAVE:
+    Eres un Agente asistente. Ya no necesitas usar etiquetas como [AGENDAR].
+    - Tienes herramientas (tools) disponibles para realizar acciones.
+    - Si el cliente pide un producto, ejecuta la herramienta 'agendar_pedido'.
+    - Si el cliente dice 'solo eso' o confirma que terminó, ejecuta 'finalizar_pedido'.
+    - Si el cliente es nuevo o cambia su nombre, ejecuta 'actualizar_nombre'.
+    - Puedes responder al usuario amablemente mientras ejecutas las herramientas.
     """
 
-    # 4. Consultar IA
+    # 4. Consultar IA (Ahora devuelve un diccionario)
+    import json # Asegúrate de importar json si no está
     respuesta = CerebroIA.consultar(prompt, mensaje)
     
-    # 5. Ejecutar Acciones
+    texto_limpio = respuesta["texto"].strip()
+    tool_calls = respuesta.get("tool_calls")
+    
+    # 5. Ejecutar Acciones (Manejador de Herramientas / Tools Handler)
     msg_final = ""
     
-    if "[NOMBRE:" in respuesta:
-        n = respuesta.split("[NOMBRE:")[1].split("]")[0].strip()
-        Database.update_cliente(telefono, n)
+    if tool_calls:
+        print(f"⚙️ La IA decidió usar {len(tool_calls)} herramienta(s).")
+        for tool in tool_calls:
+            nombre_funcion = tool["function"]["name"]
+            argumentos = json.loads(tool["function"]["arguments"])
+            
+            print(f"🔧 Ejecutando -> {nombre_funcion}({argumentos})")
+            
+            if nombre_funcion == "actualizar_nombre":
+                Database.update_cliente(telefono, argumentos.get("nombre", nombre_real))
 
-    if "[AGENDAR:" in respuesta:
-        try:
-            d = respuesta.split("[AGENDAR:")[1].split("]")[0].split("|")
-            Database.update_pedido(telefono, d[0].strip(), float(d[1].strip()))
-        except: pass
+            elif nombre_funcion == "agendar_pedido":
+                # Fíjate cómo Python recibe variables nativas y limpias (String, Float)
+                item = argumentos.get("item")
+                precio = float(argumentos.get("precio", 0))
+                Database.update_pedido(telefono, item, precio)
 
-    if "[CANCELAR]" in respuesta:
-        # Lógica de cancelar (puedes implementarla en DB si quieres)
-        pass
-
-    if "[FINALIZAR]" in respuesta:
-        Database.cerrar_pedido(telefono)
-        ped = Database.get_pedido_activo(telefono) # Traer datos frescos
-        if ped and ped['monto_total'] > 0:
-            monto_bs = float(ped['monto_total']) * Config.TASA_USD
-            msg_final = f"✅ *Pedido Confirmado*\n📝 {ped['resumen']}\n💵 Total: ${ped['monto_total']} ({monto_bs:,.2f} Bs)\n📍 Retiro en Tienda\n📲 Envía pago móvil."
-        else:
-            msg_final = "⚠️ Error: Carrito vacío. Pide de nuevo."
+            elif nombre_funcion == "finalizar_pedido":
+                Database.cerrar_pedido(telefono)
+                ped = Database.get_pedido_activo(telefono)
+                if ped and ped['monto_total'] > 0:
+                    monto_bs = float(ped['monto_total']) * Config.TASA_USD
+                    msg_final = f"✅ *Pedido Confirmado*\n📝 {ped['resumen']}\n💵 Total: ${ped['monto_total']} ({monto_bs:,.2f} Bs)\n📍 Retiro en Tienda\n📲 Envía pago móvil."
+                else:
+                    msg_final = "⚠️ Error: Carrito vacío. Pide de nuevo."
 
     # 6. Enviar Respuesta
-    texto_limpio = re.sub(r'\[.*?\]', '', respuesta).strip()
+    # Ya no hace falta quitar etiquetas con re.sub()
     
     if msg_final:
         WhatsApp.enviar_mensaje(telefono, msg_final)

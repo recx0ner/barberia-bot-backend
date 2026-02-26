@@ -11,39 +11,86 @@ class CerebroIA:
         try:
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {"Authorization": f"Bearer {Config.OPENROUTER_KEY}"}
+            
+            # 1. Definimos las herramientas (Tools / Function Calling)
+            # Esto le dice a la IA qué puede "hacer" en tu código
+            herramientas = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "agendar_pedido",
+                        "description": "Agrega un producto al pedido o carrito del cliente.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "item": {
+                                    "type": "string",
+                                    "description": "Nombre del producto a agendar (ej. Pizza Margarita)"
+                                },
+                                "precio": {
+                                    "type": "number",
+                                    "description": "Precio total del producto según el menú"
+                                }
+                            },
+                            "required": ["item", "precio"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "finalizar_pedido",
+                        "description": "Cierra el pedido actual cuando el cliente indica que ya no quiere más nada, que es todo o que está listo."
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "actualizar_nombre",
+                        "description": "Actualiza el nombre del cliente en la base de datos si es nuevo o pide que lo llamen de otra forma.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "nombre": {
+                                    "type": "string",
+                                    "description": "El nombre del cliente"
+                                }
+                            },
+                            "required": ["nombre"]
+                        }
+                    }
+                }
+            ]
+
             payload = {
                 "model": CerebroIA.MODELO,
                 "messages": [
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": mensaje_usuario}
                 ],
-                "temperature": 0.0
+                "temperature": 0.0,
+                "tools": herramientas # <-- Le pasamos el "manual de funciones"
             }
+            
             res = requests.post(url, json=payload, headers=headers, timeout=10)
-            texto = res.json()['choices'][0]['message']['content']
+            data = res.json()
             
-            # --- PARCHE DE SEGURIDAD (BUG $0) ---
-            # Si la IA devuelve monto 0 en la etiqueta, buscamos $ en el texto
-            if "[AGENDAR:" in texto:
-                try:
-                    partes = texto.split("[AGENDAR:")[1].split("]")[0].split("|")
-                    monto_ia = float(partes[1].strip()) if len(partes) > 1 else 0
-                    
-                    if monto_ia == 0:
-                        print("⚠️ IA envió $0. Aplicando Regex...")
-                        # Busca "$10", "$ 10", "10$"
-                        match = re.search(r'\$\s?(\d+(?:\.\d+)?)', texto) or re.search(r'(\d+(?:\.\d+)?)\s?\$', texto)
-                        if match:
-                            nuevo_monto = match.group(1)
-                            # Reconstruimos la etiqueta con el monto correcto
-                            texto = texto.replace(f"| {partes[1].strip()}", f"| {nuevo_monto}")
-                            print(f"✅ Corregido a: {nuevo_monto}")
-                except: pass
+            # OpenRouter / Gemini devolverá un mensaje que puede contener texto Y/O tool_calls
+            message = data['choices'][0]['message']
+            texto = message.get('content') or ""
+            tool_calls = message.get('tool_calls')
             
-            return texto
+            # Ya no necesitamos el "PARCHE DE SEGURIDAD MÁGICO CON REGEX"
+            # porque la IA ahora devuelve un objeto JSON estricto para las funciones.
+            
+            return {
+                "texto": texto,
+                "tool_calls": tool_calls
+            }
+            
         except Exception as e:
             print(f"Error IA: {e}")
-            return "Error técnico en IA."
+            return {"texto": "Error técnico en IA.", "tool_calls": None}
 
     @staticmethod
     def analizar_pago(base64_img):
