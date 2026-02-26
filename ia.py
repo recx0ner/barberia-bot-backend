@@ -40,7 +40,7 @@ class CerebroIA:
                     "type": "function",
                     "function": {
                         "name": "finalizar_pedido",
-                        "description": "Cierra el pedido actual cuando el cliente indica que ya no quiere más nada, que es todo o que está listo."
+                        "description": "Cierra y confirma el pedido actual cuando el cliente dice que quiere confirmar, que ya no quiere más nada, que es todo o que está listo para pagar."
                     }
                 },
                 {

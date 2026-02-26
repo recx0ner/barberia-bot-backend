@@ -47,8 +47,8 @@ def procesar_mensaje(telefono, nombre, mensaje):
     INSTRUCCIONES CLAVE:
     Eres un Agente asistente. Ya no necesitas usar etiquetas como [AGENDAR].
     - Tienes herramientas (tools) disponibles para realizar acciones.
-    - Si el cliente pide un producto, ejecuta la herramienta 'agendar_pedido'.
-    - Si el cliente dice 'solo eso' o confirma que terminó, ejecuta 'finalizar_pedido'.
+    - Si el cliente pide un producto (nuevo o adicional), ejecuta la herramienta 'agendar_pedido'.
+    - Si el cliente "confirma" su pedido, dice 'solo eso', o indica que ya terminó y quiere pagar, ejecuta la herramienta 'finalizar_pedido'.
     - Si el cliente es nuevo o cambia su nombre, ejecuta 'actualizar_nombre'.
     - Puedes responder al usuario amablemente mientras ejecutas las herramientas.
     """
