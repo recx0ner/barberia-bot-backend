@@ -24,6 +24,9 @@ def actualizar_tasas():
     except Exception as e:
         print(f"⚠️ Error obteniendo tasa (Usando {Config.TASA_USD} por defecto): {e}")
 
+# Llamar a la actualización en el arranque (sirve para Gunicorn o Flask run)
+actualizar_tasas()
+
 def procesar_mensaje(telefono, nombre, mensaje):
     # 1. Identificar Cliente
     nombre_real = Database.get_cliente(telefono, nombre)
@@ -133,5 +136,4 @@ def webhook():
     return "OK", 200
 
 if __name__ == "__main__":
-    actualizar_tasas()
     app.run(host='0.0.0.0', port=Config.PORT)
